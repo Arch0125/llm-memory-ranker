@@ -6,6 +6,8 @@ import pickle
 from contextlib import nullcontext
 import torch
 import tiktoken
+from memory import MemoryAwareConfig, MemoryAwareInference, SQLiteMemoryStore, build_embedder
+from memory.explain import format_trace
 from model import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
@@ -20,6 +22,26 @@ seed = 1337
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
 compile = False # use PyTorch 2.0 to compile the model to be faster
+memory_enabled = False
+memory_db_path = 'memory.sqlite'
+memory_user_id = 'default'
+memory_embedder = 'hash-384'
+memory_top_k = 12
+memory_max_items = 4
+memory_similarity_threshold = 0.18
+memory_critic_threshold = 0.58
+memory_maybe_threshold = 0.48
+memory_max_age_days = -1
+memory_token_budget = 192
+memory_type_allowlist = ''
+memory_recent_context = ''
+memory_system_prompt = ''
+memory_capture_input = False
+memory_capture_type = 'auto'
+memory_capture_importance = 0.5
+memory_version_group_id = ''
+memory_explain = False
+memory_prompt_style = 'auto'
 exec(open('configurator.py').read()) # overrides from command line or config file
 # -----------------------------------------------------------------------------
 
@@ -64,12 +86,14 @@ if load_meta:
         meta = pickle.load(f)
     # TODO want to make this more general to arbitrary encoder/decoder schemes
     stoi, itos = meta['stoi'], meta['itos']
+    allowed_chars = set(stoi.keys())
     encode = lambda s: [stoi[c] for c in s]
     decode = lambda l: ''.join([itos[i] for i in l])
 else:
     # ok let's assume gpt-2 encodings by default
     print("No meta.pkl found, assuming GPT-2 encodings...")
     enc = tiktoken.get_encoding("gpt2")
+    allowed_chars = None
     encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
     decode = lambda l: enc.decode(l)
 
@@ -77,7 +101,50 @@ else:
 if start.startswith('FILE:'):
     with open(start[5:], 'r', encoding='utf-8') as f:
         start = f.read()
+original_start = start
+
+memory_system = None
+memory_store = None
+if memory_enabled:
+    memory_store = SQLiteMemoryStore(memory_db_path)
+    embedder = build_embedder(memory_embedder)
+    memory_system = MemoryAwareInference(
+        store=memory_store,
+        embedder=embedder,
+        config=MemoryAwareConfig(
+            user_id=memory_user_id,
+            top_k=memory_top_k,
+            max_items=memory_max_items,
+            similarity_threshold=memory_similarity_threshold,
+            critic_threshold=memory_critic_threshold,
+            maybe_threshold=memory_maybe_threshold,
+            max_age_days=None if memory_max_age_days < 0 else memory_max_age_days,
+            memory_token_budget=memory_token_budget,
+            type_allowlist=memory_type_allowlist,
+        ),
+    )
+    if memory_prompt_style == 'auto':
+        resolved_memory_prompt_style = 'completion' if init_from.startswith('gpt2') and not load_meta else 'chat'
+    else:
+        resolved_memory_prompt_style = memory_prompt_style
+    start, trace, _ = memory_system.prepare_prompt(
+        query_text=original_start,
+        recent_context=memory_recent_context,
+        system_prompt=memory_system_prompt or None,
+        encode=encode,
+        plain_text_prompt=load_meta,
+        allowed_chars=allowed_chars,
+        prompt_style=resolved_memory_prompt_style,
+    )
+    if memory_explain:
+        print(format_trace(trace))
+
 start_ids = encode(start)
+if len(start_ids) > model.config.block_size:
+    print(
+        f"WARNING: prompt length {len(start_ids)} exceeds block size {model.config.block_size}; "
+        "generation will condition only on the final block."
+    )
 x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
 
 # run generation
@@ -87,3 +154,13 @@ with torch.no_grad():
             y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
             print(decode(y[0].tolist()))
             print('---------------')
+
+if memory_enabled and memory_capture_input:
+    memory_system.remember(
+        text=original_start,
+        memory_type=memory_capture_type,
+        importance=memory_capture_importance,
+        version_group_id=memory_version_group_id or None,
+    )
+if memory_store is not None:
+    memory_store.close()
