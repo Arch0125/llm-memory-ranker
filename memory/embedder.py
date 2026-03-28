@@ -1,6 +1,6 @@
 import hashlib
 
-from .utils import normalize_vector, tokenize
+from .utils import extract_dates, extract_entities, normalize_entity, normalize_vector, tokenize
 
 
 class BaseEmbedder:
@@ -49,6 +49,35 @@ class HashingEmbedder(BaseEmbedder):
         return vectors
 
 
+class TemporalHashingEmbedder(HashingEmbedder):
+    def __init__(self, dim=512, n_features_per_token=6):
+        super().__init__(dim=dim, n_features_per_token=n_features_per_token)
+        self.model_name = f"temporal-hash-{dim}"
+
+    def embed_many(self, texts):
+        vectors = []
+        for text in texts:
+            vector = [0.0] * self.dim
+            tokens = tokenize(text, drop_stopwords=False)
+            if not tokens:
+                vectors.append(vector)
+                continue
+            for token in tokens:
+                self._update_from_token(vector, token, 1.0)
+            lowered = text.lower()
+            for i in range(max(0, len(lowered) - 2)):
+                gram = lowered[i : i + 3]
+                if " " in gram:
+                    continue
+                self._update_from_token(vector, gram, 0.35)
+            for entity in extract_entities(text):
+                self._update_from_token(vector, f"entity:{normalize_entity(entity)}", 2.4)
+            for date_value in extract_dates(text):
+                self._update_from_token(vector, f"date:{date_value}", 2.8)
+            vectors.append(normalize_vector(vector))
+        return vectors
+
+
 class SentenceTransformerEmbedder(BaseEmbedder):
     def __init__(self, model_name):
         try:
@@ -68,12 +97,33 @@ class SentenceTransformerEmbedder(BaseEmbedder):
         return [list(map(float, value)) for value in values]
 
 
+class BenchmarkAutoEmbedder(BaseEmbedder):
+    def __init__(self, preferred_model="all-MiniLM-L6-v2"):
+        try:
+            delegate = SentenceTransformerEmbedder(preferred_model)
+        except RuntimeError:
+            delegate = TemporalHashingEmbedder(dim=512)
+        self.delegate = delegate
+        self.model_name = delegate.model_name
+        self.dim = delegate.dim
+
+    def embed_many(self, texts):
+        return self.delegate.embed_many(texts)
+
+
 def build_embedder(model_name="hash-384"):
     if model_name in {"hash", "hash-384"}:
         return HashingEmbedder(dim=384)
     if model_name.startswith("hash-"):
         _, dim = model_name.split("-", 1)
         return HashingEmbedder(dim=int(dim))
+    if model_name in {"benchmark-auto", "auto-benchmark"}:
+        return BenchmarkAutoEmbedder()
+    if model_name in {"temporal-hash", "temporal-hash-512"}:
+        return TemporalHashingEmbedder(dim=512)
+    if model_name.startswith("temporal-hash-"):
+        _, _, dim = model_name.split("-", 2)
+        return TemporalHashingEmbedder(dim=int(dim))
     if model_name.startswith("sentence-transformers:"):
         return SentenceTransformerEmbedder(model_name.split(":", 1)[1])
     return SentenceTransformerEmbedder(model_name)

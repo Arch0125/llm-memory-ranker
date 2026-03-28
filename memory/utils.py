@@ -5,6 +5,12 @@ from datetime import datetime, timezone
 
 
 WORD_RE = re.compile(r"[A-Za-z0-9_']+")
+DATE_RE = re.compile(r"\b\d{4}[/-]\d{2}[/-]\d{2}\b")
+QUOTED_PHRASE_RE = re.compile(r"(?<!\w)['\"]([^'\"]{2,120})['\"](?!\w)")
+TITLE_ENTITY_RE = re.compile(
+    r"\b(?:[A-Z][A-Za-z0-9]+(?:['.-][A-Za-z0-9]+)?)(?:\s+(?:[A-Z][A-Za-z0-9]+(?:['.-][A-Za-z0-9]+)?|\d+[A-Za-z0-9-]*)){0,5}"
+)
+ARTICLE_RE = re.compile(r"^(?:the|a|an)\s+", re.IGNORECASE)
 
 STOPWORDS = {
     "a",
@@ -85,6 +91,52 @@ def tokenize(text, drop_stopwords=True):
     if not drop_stopwords:
         return tokens
     return [token for token in tokens if token not in STOPWORDS]
+
+
+def normalize_date(text):
+    if not text:
+        return ""
+    match = DATE_RE.search(text)
+    if not match:
+        return ""
+    return match.group(0).replace("/", "-")
+
+
+def normalize_entity(text):
+    cleaned = " ".join((text or "").replace("\u2019", "'").split())
+    cleaned = cleaned.strip(" \t\n\r'\".,:;!?()[]{}")
+    cleaned = ARTICLE_RE.sub("", cleaned)
+    return cleaned.lower()
+
+
+def extract_dates(text):
+    return [match.group(0).replace("/", "-") for match in DATE_RE.finditer(text or "")]
+
+
+def extract_entities(text):
+    values = []
+    seen = set()
+    for match in QUOTED_PHRASE_RE.finditer(text or ""):
+        entity = normalize_entity(match.group(1))
+        tokens = [token for token in entity.split() if token not in STOPWORDS]
+        if (
+            entity
+            and entity not in seen
+            and entity not in STOPWORDS
+            and (len(tokens) > 1 or any(char.isdigit() for char in entity) or len(entity) >= 4)
+        ):
+            seen.add(entity)
+            values.append(entity)
+    for match in TITLE_ENTITY_RE.finditer(text or ""):
+        entity = normalize_entity(match.group(0))
+        if not entity or entity in seen:
+            continue
+        tokens = [token for token in entity.split() if token not in STOPWORDS]
+        if not tokens or (len(tokens) == 1 and len(tokens[0]) < 4 and not any(char.isdigit() for char in entity)):
+            continue
+        seen.add(entity)
+        values.append(entity)
+    return values
 
 
 def normalize_vector(values):

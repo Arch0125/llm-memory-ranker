@@ -12,12 +12,18 @@ import tempfile
 from pathlib import Path
 
 from benchmarks.longmemeval import (
+    analyze_question,
     abstention_score,
-    build_query_text,
+    assess_answerability,
+    build_benchmark_instructions,
     contains_match_score,
     exact_match_score,
     iter_history_memories,
     load_longmemeval_instances,
+    postprocess_prediction,
+    question_policy,
+    render_evidence_line,
+    select_bundled_hits,
     selected_session_ids,
     selected_session_recall,
     summarize_records,
@@ -25,8 +31,8 @@ from benchmarks.longmemeval import (
 )
 from benchmarks.openai_responses import build_responses_payload, create_response
 from memory import MemoryAwareConfig, MemoryAwareInference, SQLiteMemoryStore, build_embedder
-from memory.explain import format_trace
-from prompt.template import DEFAULT_SYSTEM_PROMPT, render_memory_line
+from memory.explain import build_trace, format_trace
+from prompt.template import DEFAULT_SYSTEM_PROMPT
 
 # -----------------------------------------------------------------------------
 dataset_path = "data/longmemeval_oracle.json"
@@ -36,28 +42,28 @@ summary_path = "reports/longmemeval_openai_summary.json"
 start_index = 0
 max_examples = 0
 question_types = ""
-history_granularity = "turn"
-include_assistant_turns = True
+history_granularity = "hybrid"
+include_assistant_turns = False
 include_question_date = True
-max_new_tokens = 64
+max_new_tokens = 96
 temperature = 0.0
 top_p = 1.0
 memory_enabled = True
 memory_user_id = "benchmark"
-memory_embedder = "hash-384"
-memory_top_k = 24
-memory_max_items = 8
-memory_similarity_threshold = 0.12
-memory_critic_threshold = 0.52
-memory_maybe_threshold = 0.42
+memory_embedder = "benchmark-auto"
+memory_top_k = 40
+memory_max_items = 12
+memory_similarity_threshold = 0.08
+memory_critic_threshold = 0.44
+memory_maybe_threshold = 0.34
 memory_max_age_days = -1
-memory_token_budget = 512
+memory_token_budget = 1200
 memory_type_allowlist = ""
 memory_recent_context = ""
 memory_explain = False
 openai_api_key = ""
 openai_base_url = "https://api.openai.com/v1"
-openai_model = "gpt-5-mini"
+openai_model = "gpt-4.1-mini"
 openai_timeout_seconds = 120.0
 openai_max_retries = 5
 openai_reasoning_effort = ""
@@ -66,43 +72,47 @@ exec(open("configurator.py").read())  # overrides from command line or config fi
 # -----------------------------------------------------------------------------
 
 
-def _build_memory_block(selected_hits):
-    if not selected_hits:
-        return ""
-    lines = [
-        "Retrieved memory:",
-        *[f"- {render_memory_line(hit, plain_text=True)}" for hit in selected_hits],
-        "Use retrieved memory only if it is directly relevant to the user's request.",
-    ]
-    return "\n".join(lines)
-
-
-def _build_instructions(selected_hits, recent_context="", base_system_prompt=None):
+def _build_baseline_instructions(plan, recent_context="", base_system_prompt=None):
     parts = [base_system_prompt or DEFAULT_SYSTEM_PROMPT]
-    memory_block = _build_memory_block(selected_hits)
-    if memory_block:
-        parts.append(memory_block)
     if recent_context:
         parts.append(f"Recent context:\n{recent_context.strip()}")
-    parts.append(
-        "Answer the user's request directly. If the retrieved memory is insufficient, say you do not know."
-    )
+    if plan.reasoning_kind == "ordering":
+        parts.append("Return only the event/item that happened first or last.")
+    elif plan.reasoning_kind == "difference":
+        unit = plan.unit_hint or "days"
+        parts.append(f"Return only the final duration like '7 {unit}'.")
+    elif plan.reasoning_kind == "date":
+        parts.append("Return only the final date or short date phrase.")
+    else:
+        parts.append("Return only the final answer.")
     return "\n\n".join(parts)
 
 
-def _make_memory_system(store, embedder):
+def _effective_policy(plan):
+    policy = question_policy(plan)
+    return {
+        "top_k": max(memory_top_k, policy["top_k"]),
+        "max_items": max(memory_max_items, policy["max_items"]),
+        "token_budget": max(memory_token_budget, policy["token_budget"]),
+        "similarity_threshold": min(memory_similarity_threshold, policy["similarity_threshold"]),
+        "critic_threshold": min(memory_critic_threshold, policy["critic_threshold"]),
+        "maybe_threshold": min(memory_maybe_threshold, policy["maybe_threshold"]),
+    }
+
+
+def _make_memory_system(store, embedder, policy):
     return MemoryAwareInference(
         store=store,
         embedder=embedder,
         config=MemoryAwareConfig(
             user_id=memory_user_id,
-            top_k=memory_top_k,
-            max_items=memory_max_items,
-            similarity_threshold=memory_similarity_threshold,
-            critic_threshold=memory_critic_threshold,
-            maybe_threshold=memory_maybe_threshold,
+            top_k=policy["top_k"],
+            max_items=policy["max_items"],
+            similarity_threshold=policy["similarity_threshold"],
+            critic_threshold=policy["critic_threshold"],
+            maybe_threshold=policy["maybe_threshold"],
             max_age_days=None if memory_max_age_days < 0 else memory_max_age_days,
-            memory_token_budget=memory_token_budget,
+            memory_token_budget=policy["token_budget"],
             type_allowlist=memory_type_allowlist,
         ),
     )
@@ -141,8 +151,8 @@ def _write_jsonl(path, rows):
             handle.write(json.dumps(row, ensure_ascii=True) + "\n")
 
 
-if history_granularity not in {"turn", "session"}:
-    raise ValueError("history_granularity must be 'turn' or 'session'")
+if history_granularity not in {"turn", "session", "hybrid"}:
+    raise ValueError("history_granularity must be 'turn', 'session', or 'hybrid'")
 
 resolved_api_key = openai_api_key or os.getenv("OPENAI_API_KEY", "")
 if not resolved_api_key:
@@ -162,29 +172,61 @@ detail_rows = []
 
 for index, instance in enumerate(instances, start=1):
     question_id = instance["question_id"]
-    query_text = build_query_text(instance, include_question_date=include_question_date)
+    plan = analyze_question(instance, include_question_date=include_question_date)
+    query_text = plan.query_text
 
     with tempfile.TemporaryDirectory(prefix="longmemeval-openai-") as tempdir:
         store = SQLiteMemoryStore(str(Path(tempdir) / "memory.sqlite"))
         selected_hits = []
         trace = None
+        answerability = {
+            "sufficient": False,
+            "reasons": ["no-memory-mode"],
+            "distinct_dates": [],
+            "distinct_sessions": [],
+            "covered_targets": [],
+        }
 
         if memory_enabled:
             _ingest_history(store, embedder, instance)
-            memory_system = _make_memory_system(store, embedder)
-            _, trace, selected_hits = memory_system.prepare_prompt(
-                query_text=query_text,
-                recent_context=memory_recent_context,
-                system_prompt=DEFAULT_SYSTEM_PROMPT,
+            policy = _effective_policy(plan)
+            memory_system = _make_memory_system(store, embedder, policy)
+            reranked = memory_system.rank_hits(query_text)
+            candidate_hits = [
+                hit
+                for hit in reranked
+                if hit.critic_label != "ignore" or hit.critic_confidence >= max(0.24, policy["maybe_threshold"] - 0.08)
+            ]
+            selected_hits, _ = select_bundled_hits(
+                plan,
+                candidate_hits,
+                max_items=policy["max_items"],
+                max_tokens=policy["token_budget"],
                 encode=None,
-                prompt_style="completion",
+            )
+            answerability = assess_answerability(plan, selected_hits)
+            for hit in selected_hits:
+                store.mark_retrieved(hit.record.memory_id)
+            trace = build_trace(
+                query_text=query_text,
+                retrieved_hits=reranked,
+                selected_hits=selected_hits,
+                prompt_text="\n".join(render_evidence_line(hit, index=i + 1) for i, hit in enumerate(selected_hits)),
             )
 
-        instructions = _build_instructions(
-            selected_hits=selected_hits,
-            recent_context=memory_recent_context,
-            base_system_prompt=DEFAULT_SYSTEM_PROMPT,
-        )
+        if memory_enabled:
+            instructions = build_benchmark_instructions(
+                plan=plan,
+                selected_hits=selected_hits,
+                answerability=answerability,
+                base_system_prompt=DEFAULT_SYSTEM_PROMPT,
+            )
+        else:
+            instructions = _build_baseline_instructions(
+                plan=plan,
+                recent_context=memory_recent_context,
+                base_system_prompt=DEFAULT_SYSTEM_PROMPT,
+            )
         response = create_response(
             api_key=resolved_api_key,
             payload=build_responses_payload(
@@ -206,7 +248,8 @@ for index, instance in enumerate(instances, start=1):
             timeout_seconds=openai_timeout_seconds,
             max_retries=openai_max_retries,
         )
-        hypothesis = response["output_text"]
+        raw_hypothesis = response["output_text"]
+        hypothesis = postprocess_prediction(plan, raw_hypothesis)
         store.close()
 
     if memory_explain and trace is not None:
@@ -227,6 +270,7 @@ for index, instance in enumerate(instances, start=1):
             "question": instance.get("question"),
             "answer": instance.get("answer"),
             "hypothesis": hypothesis,
+            "raw_hypothesis": raw_hypothesis,
             "openai_model": openai_model,
             "response_id": response.get("response_id"),
             "input_tokens": usage["input_tokens"],
@@ -240,12 +284,15 @@ for index, instance in enumerate(instances, start=1):
                 question_id.endswith("_abs"),
             ),
             "selected_memory_count": len(selected_hits),
+            "selected_memory_types": [hit.record.memory_type for hit in selected_hits],
             "selected_session_ids": selected_session_ids(selected_hits),
             "answer_session_ids": instance.get("answer_session_ids", []),
             "selected_session_recall": selected_session_recall(
                 selected_hits,
                 instance.get("answer_session_ids", []),
             ),
+            "answerable": answerability["sufficient"],
+            "answerability_reasons": answerability["reasons"],
         }
     )
 

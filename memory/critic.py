@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 
 from .types import CriticDecision
-from .utils import clamp, tokenize
+from .utils import clamp, extract_entities, normalize_entity, tokenize
 
 
 PERSONALIZATION_CUES = {
@@ -37,6 +37,20 @@ CONSTRAINT_CUES = {
     "safety",
 }
 
+TEMPORAL_CUES = {
+    "after",
+    "before",
+    "days",
+    "first",
+    "last",
+    "months",
+    "recent",
+    "since",
+    "time",
+    "timeline",
+    "when",
+}
+
 
 def _overlap_features(query_text, memory_text):
     query_tokens = set(tokenize(query_text))
@@ -61,12 +75,20 @@ class HeuristicCritic:
             hit.record.text,
         )
         query_tokens = set(tokenize(query_text))
+        query_entities = set(extract_entities(query_text))
+        memory_entities = {
+            normalize_entity(value) for value in hit.record.metadata.get("entities", []) if value
+        }
         personalization = bool(query_tokens & PERSONALIZATION_CUES)
         continuation = bool(query_tokens & CONTINUATION_CUES)
         constraint_request = bool(query_tokens & CONSTRAINT_CUES)
+        temporal_request = bool(query_tokens & TEMPORAL_CUES)
         recency = 1.0 if hit.age_days <= 14 else max(0.0, 1.0 - (hit.age_days / 180.0))
         type_name = hit.record.memory_type
         importance = hit.record.importance
+        entity_overlap = len(query_entities & memory_entities) / max(1, len(query_entities)) if query_entities else 0.0
+        has_event_date = bool(hit.record.metadata.get("event_date"))
+        granularity = hit.record.metadata.get("granularity", "")
 
         if type_name == "project":
             base = max(overlap * 1.05, 0.7 if continuation and lexical_anchor else 0.0)
@@ -74,6 +96,18 @@ class HeuristicCritic:
             base = overlap * 0.9
             if personalization and lexical_anchor:
                 base = max(base, 0.72)
+        elif type_name == "timeline":
+            base = overlap * 0.9
+            if temporal_request:
+                base = max(base, 0.62 if has_event_date else 0.52)
+        elif type_name == "episode":
+            base = overlap * 0.95
+            if temporal_request:
+                base = max(base, 0.58 if has_event_date else 0.48)
+        elif type_name == "event":
+            base = overlap
+            if temporal_request and has_event_date:
+                base = max(base, 0.72 if entity_overlap > 0.0 else 0.56)
         elif type_name in {"constraint", "safety"}:
             base = max(overlap, 0.75 if constraint_request and lexical_anchor else 0.0)
         elif type_name == "identity":
@@ -87,33 +121,49 @@ class HeuristicCritic:
             base *= 0.75
         if type_name == "preference" and personalization and not has_shared:
             base *= 0.4
+        if temporal_request:
+            base += 0.22 * entity_overlap
+            if granularity in {"timeline-global", "timeline"}:
+                base += 0.08
+            if has_event_date:
+                base += 0.06
 
         confidence = clamp(
-            (0.52 * hit.score)
-            + (0.30 * base)
+            (0.44 * hit.score)
+            + (0.28 * base)
             + (0.10 * importance)
             + (0.08 * recency),
             0.0,
             1.0,
         )
+        if temporal_request:
+            confidence = clamp(confidence + (0.10 * entity_overlap) + (0.06 if has_event_date else 0.0))
 
         reasons = []
         if shared_tokens:
             reasons.append("shared=" + ",".join(shared_tokens))
+        if entity_overlap > 0.0:
+            reasons.append(f"entity-overlap={entity_overlap:.2f}")
         if continuation:
             reasons.append("continuation-cue")
         if personalization:
             reasons.append("personalization-cue")
         if constraint_request:
             reasons.append("constraint-cue")
+        if temporal_request:
+            reasons.append("temporal-cue")
+        if has_event_date:
+            reasons.append("dated")
         if hit.age_days > 30:
             reasons.append(f"aged={hit.age_days}d")
         if query_coverage > 0.5:
             reasons.append("covers-query")
 
-        if confidence >= self.use_threshold and (has_shared or type_name in {"constraint", "safety"}):
+        if confidence >= self.use_threshold and (
+            has_shared or entity_overlap > 0.0 or type_name in {"constraint", "safety", "timeline"}
+        ):
             return CriticDecision(label="use", confidence=confidence, reasons=reasons)
-        if confidence >= self.maybe_threshold and has_shared:
+        if confidence >= self.maybe_threshold and (has_shared or entity_overlap > 0.0 or temporal_request):
             return CriticDecision(label="maybe", confidence=confidence, reasons=reasons)
         return CriticDecision(label="ignore", confidence=confidence, reasons=reasons or ["low-applicability"])
 

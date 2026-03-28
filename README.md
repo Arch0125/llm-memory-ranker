@@ -5,7 +5,7 @@ This repository is an experimentation workspace for:
 - a typed memory layer with retrieval, gating, reranking, and prompt assembly
 - OpenAI API benchmarking on LongMemEval
 
-The core memory system leaves the generator unchanged. It retrieves candidate memories from a local SQLite store, scores whether they should be used, and then injects only the selected memories into the prompt before sending the request to OpenAI.
+The core memory system leaves the generator unchanged. It stores hybrid benchmark memories (facts, episode summaries, and timeline memories), extracts temporal metadata, bundles relevant evidence, and then sends a structured evidence table to OpenAI for generation.
 
 ## Layout
 
@@ -20,6 +20,12 @@ Install the Python dependencies you need inside the repo virtualenv:
 
 ```sh
 ./venv/bin/pip install httpx
+```
+
+Optional: install a stronger local retrieval encoder. The benchmark runner defaults to `benchmark-auto`, which uses `all-MiniLM-L6-v2` if `sentence-transformers` is installed and otherwise falls back to a temporal hashing embedder.
+
+```sh
+./venv/bin/pip install sentence-transformers
 ```
 
 Seed a couple of memories:
@@ -52,14 +58,21 @@ export OPENAI_API_KEY=...
 ./venv/bin/python benchmark_longmemeval_openai.py \
   --dataset_path=data/longmemeval_oracle.json \
   --max_examples=25 \
-  --openai_model=gpt-5-mini \
+  --openai_model=gpt-4.1-mini \
   --output_path=reports/longmemeval_openai_predictions.jsonl \
   --details_path=reports/longmemeval_openai_details.jsonl \
   --summary_path=reports/longmemeval_openai_summary.json \
   --memory_enabled=True
 ```
 
-`output_path` is intentionally compatible with the official LongMemEval evaluation script: each line contains only `question_id` and `hypothesis`. The companion `details_path` file includes local metrics such as exact match, token F1, selected memory count, selected-session recall, and OpenAI token usage.
+Current defaults are tuned for LongMemEval temporal questions:
+
+- `history_granularity=hybrid`
+- `memory_embedder=benchmark-auto`
+- session, fact, and timeline memories are all ingested
+- retrieved memories are bundled into a compact evidence table before generation
+
+`output_path` is intentionally compatible with the official LongMemEval evaluation script: each line contains only `question_id` and `hypothesis`. The companion `details_path` file includes local metrics such as exact match, token F1, selected memory count, selected-session recall, answerability, and OpenAI token usage.
 
 To benchmark the hosted model without the memory layer, rerun with `--memory_enabled=False` and compare the two summary JSON files.
 

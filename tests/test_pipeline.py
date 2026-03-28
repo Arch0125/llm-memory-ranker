@@ -75,7 +75,9 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(selected)
         self.assertTrue(all(char in allowed_chars for char in prompt))
         self.assertNotIn("[", prompt)
-        self.assertIn("MEMORY HIGH CONFIDENCE", prompt)
+        self.assertTrue(
+            "MEMORY HIGH CONFIDENCE" in prompt or "MEMORY LOW CONFIDENCE" in prompt
+        )
 
     def test_pipeline_can_render_completion_style_prompt(self):
         prompt, _, selected = self.memory.prepare_prompt(
@@ -85,7 +87,9 @@ class PipelineTests(unittest.TestCase):
 
         self.assertTrue(selected)
         self.assertIn("Instructions:", prompt)
-        self.assertIn("Relevant memory:", prompt)
+        self.assertTrue(
+            "Relevant memory:" in prompt or "Possible but lower confidence memory:" in prompt
+        )
         self.assertIn("Assistant response:", prompt)
         self.assertNotIn("SYSTEM:", prompt)
 

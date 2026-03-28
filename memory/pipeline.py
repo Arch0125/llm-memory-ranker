@@ -29,16 +29,7 @@ class MemoryAwareInference:
         self.critic = critic or HeuristicCritic()
         self.config = config or MemoryAwareConfig()
 
-    def prepare_prompt(
-        self,
-        query_text,
-        recent_context="",
-        system_prompt=None,
-        encode=None,
-        plain_text_prompt=False,
-        allowed_chars=None,
-        prompt_style="chat",
-    ):
+    def rank_hits(self, query_text):
         type_allowlist = parse_type_allowlist(self.config.type_allowlist)
         retrieved = retrieve_candidates(
             query_text=query_text,
@@ -54,8 +45,9 @@ class MemoryAwareInference:
             max_age_days=self.config.max_age_days,
             stable_importance_threshold=self.config.stable_importance_threshold,
         )
-        reranked = rerank_with_critic(query_text, gated, self.critic)
+        return rerank_with_critic(query_text, gated, self.critic)
 
+    def choose_hits(self, reranked):
         chosen = []
         low_confidence_slots = 1
         for hit in reranked:
@@ -68,15 +60,47 @@ class MemoryAwareInference:
             ):
                 chosen.append(hit)
                 low_confidence_slots -= 1
+        return chosen
 
-        selected, _ = select_memories(
-            chosen,
-            max_items=self.config.max_items,
-            max_tokens=self.config.memory_token_budget,
+    def budget_hits(
+        self,
+        hits,
+        encode=None,
+        plain_text_prompt=False,
+        allowed_chars=None,
+        prompt_style="chat",
+        max_items=None,
+        max_tokens=None,
+    ):
+        return select_memories(
+            hits,
+            max_items=max_items or self.config.max_items,
+            max_tokens=max_tokens or self.config.memory_token_budget,
             encode=encode,
             plain_text=plain_text_prompt,
             allowed_chars=allowed_chars,
             style=prompt_style,
+        )
+
+    def prepare_prompt(
+        self,
+        query_text,
+        recent_context="",
+        system_prompt=None,
+        encode=None,
+        plain_text_prompt=False,
+        allowed_chars=None,
+        prompt_style="chat",
+    ):
+        reranked = self.rank_hits(query_text)
+        chosen = self.choose_hits(reranked)
+
+        selected, _ = self.budget_hits(
+            chosen,
+            encode=encode,
+            plain_text_prompt=plain_text_prompt,
+            allowed_chars=allowed_chars,
+            prompt_style=prompt_style,
         )
         if not selected and not recent_context and not self.config.inject_system_prompt_without_memory:
             from prompt.template import sanitize_for_allowed_chars

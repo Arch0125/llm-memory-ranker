@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 
 import httpx
@@ -19,17 +20,16 @@ def build_responses_payload(
     payload = {
         "model": model,
         "instructions": instructions,
-        "input": [
-            {
-                "role": "user",
-                "content": [{"type": "input_text", "text": user_input}],
-            }
-        ],
+        "input": user_input,
         "max_output_tokens": max_output_tokens,
-        "temperature": temperature,
-        "top_p": top_p,
         "store": False,
     }
+    # Keep the default request shape minimal. Some hosted models reject
+    # explicit sampling params when they are set to default-like values.
+    if temperature not in (None, 0.0, 1.0):
+        payload["temperature"] = temperature
+    if top_p not in (None, 1.0):
+        payload["top_p"] = top_p
     if metadata:
         payload["metadata"] = {str(key): str(value) for key, value in metadata.items()}
     if reasoning_effort:
@@ -82,6 +82,7 @@ def create_response(
     }
 
     last_error = None
+    last_error_body = None
     with httpx.Client(timeout=timeout_seconds) as client:
         for attempt in range(max_retries + 1):
             try:
@@ -99,8 +100,17 @@ def create_response(
                 }
             except httpx.HTTPError as exc:
                 last_error = exc
+                if getattr(exc, "response", None) is not None:
+                    try:
+                        last_error_body = json.dumps(exc.response.json(), ensure_ascii=True)
+                    except Exception:
+                        last_error_body = exc.response.text
                 if attempt >= max_retries:
                     break
                 time.sleep(min(8.0, 0.75 * (2 ** attempt)))
 
+    if last_error_body:
+        raise RuntimeError(
+            f"OpenAI Responses API call failed: {last_error}. Response body: {last_error_body}"
+        )
     raise RuntimeError(f"OpenAI Responses API call failed: {last_error}")

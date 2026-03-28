@@ -21,10 +21,24 @@ class OpenAIResponsesHelpersTest(unittest.TestCase):
             verbosity="low",
         )
         self.assertEqual(payload["model"], "gpt-4.1-mini")
-        self.assertEqual(payload["input"][0]["content"][0]["text"], "Hello")
+        self.assertEqual(payload["input"], "Hello")
         self.assertEqual(payload["reasoning"]["effort"], "low")
         self.assertEqual(payload["text"]["verbosity"], "low")
         self.assertEqual(payload["metadata"]["question_id"], "q1")
+        self.assertNotIn("temperature", payload)
+        self.assertNotIn("top_p", payload)
+
+    def test_build_responses_payload_keeps_non_default_sampling_fields(self):
+        payload = build_responses_payload(
+            model="gpt-4.1-mini",
+            instructions="You are helpful.",
+            user_input="Hello",
+            max_output_tokens=32,
+            temperature=0.7,
+            top_p=0.9,
+        )
+        self.assertEqual(payload["temperature"], 0.7)
+        self.assertEqual(payload["top_p"], 0.9)
 
     def test_extract_output_text_prefers_output_text(self):
         response_json = {
