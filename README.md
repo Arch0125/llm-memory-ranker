@@ -15,6 +15,8 @@ The core memory system leaves the base language model unchanged. It retrieves ca
 - `prompt/`: prompt assembly and budget selection
 - `memory_cli.py`: inspect and manage local memories
 - `sample_mlx.py`: Apple Silicon runner using `mlx-lm`
+- `benchmark_longmemeval.py`: run the local memory stack on the public LongMemEval benchmark
+- `benchmark_longmemeval_openai.py`: run the same benchmark with OpenAI as the generator
 
 ## Quick Start
 
@@ -60,6 +62,38 @@ Run the Apple Silicon path with the default MLX instruct model:
   --memory_explain=True
 ```
 
+Run the public LongMemEval benchmark with the same MLX memory layer:
+
+```sh
+./venv/bin/python benchmark_longmemeval.py \
+  --dataset_path=data/longmemeval_oracle.json \
+  --max_examples=25 \
+  --output_path=reports/longmemeval_oracle_predictions.jsonl \
+  --details_path=reports/longmemeval_oracle_details.jsonl \
+  --summary_path=reports/longmemeval_oracle_summary.json \
+  --memory_enabled=True \
+  --memory_explain=False
+```
+
+`output_path` is intentionally compatible with the official LongMemEval evaluation script: each line contains only `question_id` and `hypothesis`. The companion `details_path` file includes local metrics such as exact match, token F1, selected memory count, and selected-session recall.
+
+Run the same benchmark with OpenAI as the generator while keeping retrieval and gating local:
+
+```sh
+export OPENAI_API_KEY=...
+
+./venv/bin/python benchmark_longmemeval_openai.py \
+  --dataset_path=data/longmemeval_oracle.json \
+  --max_examples=25 \
+  --openai_model=gpt-5-mini \
+  --output_path=reports/longmemeval_openai_predictions.jsonl \
+  --details_path=reports/longmemeval_openai_details.jsonl \
+  --summary_path=reports/longmemeval_openai_summary.json \
+  --memory_enabled=True
+```
+
+To benchmark the hosted model without the memory layer, rerun with `--memory_enabled=False` and compare the two summary JSON files.
+
 Run the Torch sampler with the local memory layer:
 
 ```sh
@@ -101,3 +135,14 @@ Run the tests with:
 ```sh
 ./venv/bin/python -m unittest discover -s tests
 ```
+
+## Standard Benchmark Data
+
+For a public long-term memory benchmark, use LongMemEval. Download one of the official JSON files into `data/`:
+
+```sh
+mkdir -p data
+curl -L https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_oracle.json -o data/longmemeval_oracle.json
+```
+
+For quick validation, `longmemeval_oracle.json` is the easiest starting point because it contains only the evidence sessions. For harder retrieval stress tests, use `longmemeval_s_cleaned.json` or `longmemeval_m_cleaned.json` with the same runner.
