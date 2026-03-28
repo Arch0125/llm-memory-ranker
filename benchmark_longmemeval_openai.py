@@ -16,6 +16,7 @@ from benchmarks.longmemeval import (
     abstention_score,
     assess_answerability,
     build_benchmark_instructions,
+    build_structured_event_view,
     contains_match_score,
     exact_match_score,
     iter_history_memories,
@@ -26,6 +27,7 @@ from benchmarks.longmemeval import (
     select_bundled_hits,
     selected_session_ids,
     selected_session_recall,
+    solve_temporal_question,
     summarize_records,
     token_f1_score,
 )
@@ -61,6 +63,9 @@ memory_token_budget = 1200
 memory_type_allowlist = ""
 memory_recent_context = ""
 memory_explain = False
+memory_solver_mode = "hybrid"
+memory_solver_min_confidence = 0.72
+memory_structured_event_limit = 4
 openai_api_key = ""
 openai_base_url = "https://api.openai.com/v1"
 openai_model = "gpt-4.1-mini"
@@ -116,6 +121,22 @@ def _make_memory_system(store, embedder, policy):
             type_allowlist=memory_type_allowlist,
         ),
     )
+
+
+def _solver_allowed_reasoning_kind(plan):
+    return plan.reasoning_kind in {"ordering", "date"}
+
+
+def _structured_events_for_prompt(plan, structured_events, solver_result):
+    if not structured_events:
+        return []
+    if not _solver_allowed_reasoning_kind(plan):
+        return []
+    if solver_result and solver_result.resolved:
+        return structured_events[:memory_structured_event_limit]
+    if solver_result and solver_result.confidence >= max(0.45, memory_solver_min_confidence - 0.2):
+        return structured_events[: min(2, memory_structured_event_limit)]
+    return []
 
 
 def _filter_instances(instances):
@@ -178,6 +199,8 @@ for index, instance in enumerate(instances, start=1):
     with tempfile.TemporaryDirectory(prefix="longmemeval-openai-") as tempdir:
         store = SQLiteMemoryStore(str(Path(tempdir) / "memory.sqlite"))
         selected_hits = []
+        structured_events = []
+        solver_result = None
         trace = None
         answerability = {
             "sufficient": False,
@@ -205,6 +228,12 @@ for index, instance in enumerate(instances, start=1):
                 encode=None,
             )
             answerability = assess_answerability(plan, selected_hits)
+            structured_events = build_structured_event_view(
+                plan,
+                selected_hits,
+                limit=memory_structured_event_limit,
+            )
+            solver_result = solve_temporal_question(plan, selected_hits)
             for hit in selected_hits:
                 store.mark_retrieved(hit.record.memory_id)
             trace = build_trace(
@@ -213,6 +242,11 @@ for index, instance in enumerate(instances, start=1):
                 selected_hits=selected_hits,
                 prompt_text="\n".join(render_evidence_line(hit, index=i + 1) for i, hit in enumerate(selected_hits)),
             )
+        prompt_structured_events = _structured_events_for_prompt(
+            plan,
+            structured_events,
+            solver_result,
+        )
 
         if memory_enabled:
             instructions = build_benchmark_instructions(
@@ -220,6 +254,15 @@ for index, instance in enumerate(instances, start=1):
                 selected_hits=selected_hits,
                 answerability=answerability,
                 base_system_prompt=DEFAULT_SYSTEM_PROMPT,
+                structured_events=prompt_structured_events,
+                solver_result=(
+                    solver_result
+                    if solver_result
+                    and solver_result.resolved
+                    and _solver_allowed_reasoning_kind(plan)
+                    and solver_result.confidence >= max(0.55, memory_solver_min_confidence - 0.1)
+                    else None
+                ),
             )
         else:
             instructions = _build_baseline_instructions(
@@ -227,29 +270,60 @@ for index, instance in enumerate(instances, start=1):
                 recent_context=memory_recent_context,
                 base_system_prompt=DEFAULT_SYSTEM_PROMPT,
             )
-        response = create_response(
-            api_key=resolved_api_key,
-            payload=build_responses_payload(
-                model=openai_model,
-                instructions=instructions,
-                user_input=query_text,
-                max_output_tokens=max_new_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                metadata={
-                    "benchmark": "longmemeval",
-                    "question_id": question_id,
-                    "memory_enabled": memory_enabled,
-                },
-                reasoning_effort=openai_reasoning_effort,
-                verbosity=openai_verbosity,
-            ),
-            base_url=openai_base_url,
-            timeout_seconds=openai_timeout_seconds,
-            max_retries=openai_max_retries,
+        use_solver_directly = bool(
+            memory_enabled
+            and solver_result is not None
+            and solver_result.resolved
+            and _solver_allowed_reasoning_kind(plan)
+            and memory_solver_mode in {"hybrid", "finalize"}
+            and solver_result.confidence >= memory_solver_min_confidence
         )
-        raw_hypothesis = response["output_text"]
-        hypothesis = postprocess_prediction(plan, raw_hypothesis)
+        if memory_solver_mode == "finalize":
+            use_solver_directly = bool(
+                memory_enabled
+                and solver_result is not None
+                and solver_result.resolved
+                and _solver_allowed_reasoning_kind(plan)
+                and solver_result.confidence >= memory_solver_min_confidence
+            )
+        if use_solver_directly:
+            raw_hypothesis = solver_result.answer
+            hypothesis = solver_result.answer
+            response = {
+                "output_text": raw_hypothesis,
+                "response_id": None,
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                },
+            }
+            generation_mode = f"solver:{solver_result.mode}"
+        else:
+            response = create_response(
+                api_key=resolved_api_key,
+                payload=build_responses_payload(
+                    model=openai_model,
+                    instructions=instructions,
+                    user_input=query_text,
+                    max_output_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    metadata={
+                        "benchmark": "longmemeval",
+                        "question_id": question_id,
+                        "memory_enabled": memory_enabled,
+                    },
+                    reasoning_effort=openai_reasoning_effort,
+                    verbosity=openai_verbosity,
+                ),
+                base_url=openai_base_url,
+                timeout_seconds=openai_timeout_seconds,
+                max_retries=openai_max_retries,
+            )
+            raw_hypothesis = response["output_text"]
+            hypothesis = postprocess_prediction(plan, raw_hypothesis)
+            generation_mode = "openai"
         store.close()
 
     if memory_explain and trace is not None:
@@ -273,6 +347,7 @@ for index, instance in enumerate(instances, start=1):
             "raw_hypothesis": raw_hypothesis,
             "openai_model": openai_model,
             "response_id": response.get("response_id"),
+            "generation_mode": generation_mode,
             "input_tokens": usage["input_tokens"],
             "output_tokens": usage["output_tokens"],
             "total_tokens": usage["total_tokens"],
@@ -285,6 +360,7 @@ for index, instance in enumerate(instances, start=1):
             ),
             "selected_memory_count": len(selected_hits),
             "selected_memory_types": [hit.record.memory_type for hit in selected_hits],
+            "structured_event_count": len(structured_events),
             "selected_session_ids": selected_session_ids(selected_hits),
             "answer_session_ids": instance.get("answer_session_ids", []),
             "selected_session_recall": selected_session_recall(
@@ -293,6 +369,10 @@ for index, instance in enumerate(instances, start=1):
             ),
             "answerable": answerability["sufficient"],
             "answerability_reasons": answerability["reasons"],
+            "solver_resolved": bool(solver_result and solver_result.resolved),
+            "solver_confidence": solver_result.confidence if solver_result else 0.0,
+            "solver_answer": solver_result.answer if solver_result else "",
+            "solver_mode": solver_result.mode if solver_result else "",
         }
     )
 
@@ -306,6 +386,8 @@ summary.update(
         "memory_enabled": memory_enabled,
         "history_granularity": history_granularity,
         "include_assistant_turns": include_assistant_turns,
+        "memory_solver_mode": memory_solver_mode,
+        "memory_solver_min_confidence": memory_solver_min_confidence,
         "openai_model": openai_model,
         "output_path": output_path,
         "details_path": details_path,

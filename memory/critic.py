@@ -79,6 +79,10 @@ class HeuristicCritic:
         memory_entities = {
             normalize_entity(value) for value in hit.record.metadata.get("entities", []) if value
         }
+        query_text_normalized = normalize_entity(query_text)
+        memory_aliases = {
+            normalize_entity(value) for value in hit.record.metadata.get("event_aliases", []) if value
+        }
         personalization = bool(query_tokens & PERSONALIZATION_CUES)
         continuation = bool(query_tokens & CONTINUATION_CUES)
         constraint_request = bool(query_tokens & CONSTRAINT_CUES)
@@ -88,6 +92,17 @@ class HeuristicCritic:
         importance = hit.record.importance
         entity_overlap = len(query_entities & memory_entities) / max(1, len(query_entities)) if query_entities else 0.0
         has_event_date = bool(hit.record.metadata.get("event_date"))
+        date_confidence = float(hit.record.metadata.get("date_confidence", 0.0) or 0.0)
+        alias_overlap = 0.0
+        if memory_aliases:
+            alias_overlap = max(
+                1.0
+                for alias in memory_aliases
+                if alias and (alias in query_text_normalized or all(part in query_text_normalized for part in alias.split() if len(part) >= 3))
+            ) if any(
+                alias and (alias in query_text_normalized or all(part in query_text_normalized for part in alias.split() if len(part) >= 3))
+                for alias in memory_aliases
+            ) else 0.0
         granularity = hit.record.metadata.get("granularity", "")
 
         if type_name == "project":
@@ -123,10 +138,12 @@ class HeuristicCritic:
             base *= 0.4
         if temporal_request:
             base += 0.22 * entity_overlap
+            base += 0.18 * alias_overlap
             if granularity in {"timeline-global", "timeline"}:
                 base += 0.08
             if has_event_date:
                 base += 0.06
+                base += 0.10 * date_confidence
 
         confidence = clamp(
             (0.44 * hit.score)
@@ -137,13 +154,15 @@ class HeuristicCritic:
             1.0,
         )
         if temporal_request:
-            confidence = clamp(confidence + (0.10 * entity_overlap) + (0.06 if has_event_date else 0.0))
+            confidence = clamp(confidence + (0.10 * entity_overlap) + (0.08 * alias_overlap) + (0.06 if has_event_date else 0.0) + (0.05 * date_confidence))
 
         reasons = []
         if shared_tokens:
             reasons.append("shared=" + ",".join(shared_tokens))
         if entity_overlap > 0.0:
             reasons.append(f"entity-overlap={entity_overlap:.2f}")
+        if alias_overlap > 0.0:
+            reasons.append(f"alias-overlap={alias_overlap:.2f}")
         if continuation:
             reasons.append("continuation-cue")
         if personalization:
@@ -154,6 +173,8 @@ class HeuristicCritic:
             reasons.append("temporal-cue")
         if has_event_date:
             reasons.append("dated")
+        if date_confidence > 0.0:
+            reasons.append(f"date-conf={date_confidence:.2f}")
         if hit.age_days > 30:
             reasons.append(f"aged={hit.age_days}d")
         if query_coverage > 0.5:

@@ -3,12 +3,14 @@ import unittest
 from benchmarks.longmemeval import (
     acceptable_answers,
     analyze_question,
+    build_structured_event_view,
     build_query_text,
     contains_match_score,
     exact_match_score,
     iter_history_memories,
     normalize_answer,
     postprocess_prediction,
+    solve_temporal_question,
     select_bundled_hits,
     selected_session_recall,
     summarize_records,
@@ -27,6 +29,8 @@ def make_hit(
     granularity="fact",
     score=0.9,
     confidence=0.8,
+    date_confidence=0.9,
+    date_source="explicit-date",
 ):
     return MemoryHit(
         record=MemoryRecord(
@@ -40,9 +44,33 @@ def make_hit(
             metadata={
                 "session_id": session_id,
                 "event_date": event_date,
+                "event_dates": [event_date] if event_date else [],
                 "entities": entities or [],
                 "granularity": granularity,
                 "fact_text": text,
+                "event_aliases": entities or [],
+                "date_confidence": date_confidence,
+                "date_source": date_source,
+                "event_items": [
+                    {
+                        "label": text,
+                        "normalized_label": normalize_answer(text),
+                        "aliases": entities or [],
+                        "activity_type": memory_type,
+                        "event_date": event_date,
+                        "date_source": date_source,
+                        "date_confidence": date_confidence,
+                        "date_candidates": (
+                            [{"date": event_date, "source": date_source, "confidence": date_confidence}]
+                            if event_date
+                            else []
+                        ),
+                        "session_id": session_id,
+                        "turn_index": 0,
+                        "role": "user",
+                        "has_answer": True,
+                    }
+                ],
             },
         ),
         score=score,
@@ -82,6 +110,8 @@ class LongMemEvalHelpersTest(unittest.TestCase):
         self.assertEqual(memories[0]["metadata"]["session_id"], "s1")
         self.assertEqual(memories[0]["metadata"]["event_date"], "2024-01-01")
         self.assertEqual(memories[0]["metadata"]["granularity"], "fact")
+        self.assertIn("event_items", memories[0]["metadata"])
+        self.assertIn("date_source", memories[0]["metadata"])
 
     def test_iter_history_memories_turn_granularity_prefers_explicit_turn_date(self):
         instance = {
@@ -126,6 +156,115 @@ class LongMemEvalHelpersTest(unittest.TestCase):
         memories = list(iter_history_memories(instance, granularity="turn", include_assistant_turns=False))
         self.assertEqual(memories[0]["metadata"]["event_date"], "2023-05-01")
 
+    def test_iter_history_memories_turn_granularity_derives_article_relative_date(self):
+        instance = {
+            "question_id": "q-relative-article",
+            "question_type": "temporal-reasoning",
+            "question": "When did I set up the smart thermostat?",
+            "answer": "2023-04-24",
+            "question_date": "2023/05/24 (Wed) 10:00",
+            "haystack_session_ids": ["s1"],
+            "haystack_dates": ["2023/05/24 (Wed) 02:06"],
+            "haystack_sessions": [[
+                {
+                    "role": "user",
+                    "content": "Also, since I set up my smart thermostat a month ago, I've noticed that it's been learning my schedule.",
+                    "has_answer": True,
+                }
+            ]],
+            "answer_session_ids": ["s1"],
+        }
+        memories = list(iter_history_memories(instance, granularity="turn", include_assistant_turns=False))
+        self.assertEqual(memories[0]["metadata"]["event_date"], "2023-04-24")
+
+    def test_iter_history_memories_turn_granularity_keeps_target_terms_in_fact_text(self):
+        instance = {
+            "question_id": "q-target-terms",
+            "question_type": "temporal-reasoning",
+            "question": "Which seeds were started first, the tomatoes or the marigolds?",
+            "answer": "Tomatoes",
+            "question_date": "2023/03/10 (Fri) 08:29",
+            "haystack_session_ids": ["s1"],
+            "haystack_dates": ["2023/03/10 (Fri) 00:33"],
+            "haystack_sessions": [[
+                {
+                    "role": "user",
+                    "content": "I'm planning to plant out my seedlings soon and I'm wondering if you can tell me the average soil temperature for my area. By the way, I've been starting seeds indoors under grow lights in my basement since February 20th - tomatoes, peppers, and cucumbers are all doing well, about 2-3 inches tall now.",
+                    "has_answer": True,
+                }
+            ]],
+            "answer_session_ids": ["s1"],
+        }
+        memories = list(iter_history_memories(instance, granularity="turn", include_assistant_turns=False))
+        self.assertIn("tomatoes", memories[0]["text"].lower())
+        self.assertIn("tomatoes", memories[0]["metadata"]["fact_text"].lower())
+        self.assertIn("tomatoes", memories[0]["metadata"]["event_aliases"])
+
+    def test_iter_history_memories_turn_granularity_prefers_relative_anchor_date(self):
+        instance = {
+            "question_id": "q-relative-anchor",
+            "question_type": "temporal-reasoning",
+            "question": "How many days before I bought the iPhone 13 Pro did I attend the Holiday Market?",
+            "answer": "7 days",
+            "question_date": "2023/12/10 (Sun) 23:13",
+            "haystack_session_ids": ["s1"],
+            "haystack_dates": ["2023/12/10 (Sun) 23:13"],
+            "haystack_sessions": [[
+                {
+                    "role": "user",
+                    "content": "I attended the annual Holiday Market at the local mall a week before Black Friday, and I saw some unique handmade jewelry there.",
+                    "has_answer": True,
+                }
+            ]],
+            "answer_session_ids": ["s1"],
+        }
+        memories = list(iter_history_memories(instance, granularity="turn", include_assistant_turns=False))
+        self.assertEqual(memories[0]["metadata"]["event_date"], "2023-11-17")
+        self.assertEqual(memories[0]["metadata"]["date_source"], "relative-before-black-friday")
+
+    def test_iter_history_memories_turn_granularity_extracts_got_purchase_target(self):
+        instance = {
+            "question_id": "q-got-purchase",
+            "question_type": "temporal-reasoning",
+            "question": "When did I get the iPhone 13 Pro?",
+            "answer": "2023-11-24",
+            "question_date": "2023/12/10 (Sun) 23:13",
+            "haystack_session_ids": ["s1"],
+            "haystack_dates": ["2023/12/10 (Sun) 11:49"],
+            "haystack_sessions": [[
+                {
+                    "role": "user",
+                    "content": "I'm looking to upgrade my phone case and screen protector. By the way, I got my iPhone 13 Pro at a discounted price of $800 from Best Buy on Black Friday.",
+                    "has_answer": True,
+                }
+            ]],
+            "answer_session_ids": ["s1"],
+        }
+        memories = list(iter_history_memories(instance, granularity="turn", include_assistant_turns=False))
+        self.assertEqual(memories[0]["metadata"]["event_date"], "2023-11-24")
+        self.assertIn("iphone 13 pro", " ".join(memories[0]["metadata"]["event_aliases"]))
+
+    def test_iter_history_memories_turn_granularity_parses_day_of_month(self):
+        instance = {
+            "question_id": "q-day-month",
+            "question_type": "temporal-reasoning",
+            "question": "When did I attend the BBQ party?",
+            "answer": "June 3",
+            "question_date": "2023/07/01 (Sat) 22:22",
+            "haystack_session_ids": ["s1"],
+            "haystack_dates": ["2023/07/01 (Sat) 22:22"],
+            "haystack_sessions": [[
+                {
+                    "role": "user",
+                    "content": "I attended a backyard BBQ party at my colleague's house on the 3rd of June, and they had an amazing selection of BBQ sauces.",
+                    "has_answer": True,
+                }
+            ]],
+            "answer_session_ids": ["s1"],
+        }
+        memories = list(iter_history_memories(instance, granularity="turn", include_assistant_turns=False))
+        self.assertEqual(memories[0]["metadata"]["event_date"], "2023-06-03")
+
     def test_iter_history_memories_session_granularity_yields_episode_memories(self):
         memories = list(
             iter_history_memories(
@@ -158,10 +297,27 @@ class LongMemEvalHelpersTest(unittest.TestCase):
             ["Effective Time Management", "Data Analysis using Python"],
         )
 
+    def test_analyze_question_keeps_date_questions_as_date_reasoning(self):
+        instance = {
+            "question_id": "q-date-kind",
+            "question_type": "temporal-reasoning",
+            "question": "What was the date on which I attended the first BBQ event in June?",
+            "answer": "June 3rd",
+            "question_date": "2024/06/20 (Thu) 10:00",
+            "haystack_session_ids": [],
+            "haystack_dates": [],
+            "haystack_sessions": [],
+            "answer_session_ids": [],
+        }
+        plan = analyze_question(instance)
+        self.assertEqual(plan.reasoning_kind, "date")
+        self.assertEqual(plan.filter_month, "06")
+
     def test_answer_metrics_support_acceptable_variants(self):
         self.assertEqual(normalize_answer("The Sushi!"), "sushi")
         self.assertEqual(acceptable_answers("7 days. 8 days (including the last day) is also acceptable."), ["7 days", "8 days"])
         self.assertEqual(exact_match_score("8 days", "7 days. 8 days (including the last day) is also acceptable."), 1.0)
+        self.assertEqual(exact_match_score("June 3", "June 3rd"), 1.0)
         self.assertEqual(contains_match_score("The answer is sushi", "sushi"), 1.0)
         self.assertGreater(token_f1_score("the user prefers sushi", "sushi"), 0.0)
 
@@ -205,6 +361,106 @@ class LongMemEvalHelpersTest(unittest.TestCase):
 
         self.assertGreaterEqual(len(selected), 2)
         self.assertTrue(answerability["sufficient"])
+
+    def test_build_structured_event_view_prefers_target_facts(self):
+        plan = analyze_question(self.instance)
+        hits = [
+            make_hit(
+                "s1",
+                text="2024-01-01 | Attended the Data Analysis using Python webinar.",
+                event_date="2024-01-01",
+                entities=["data analysis using python", "data analysis using python webinar"],
+            ),
+            make_hit(
+                "s2",
+                text="2024-01-05 | Attended the Effective Time Management workshop.",
+                event_date="2024-01-05",
+                entities=["effective time management", "effective time management workshop"],
+            ),
+        ]
+        events = build_structured_event_view(plan, hits, limit=4)
+        self.assertEqual(len(events), 2)
+        self.assertIn("data analysis using python", events[0]["aliases"])
+
+    def test_solve_temporal_question_ordering(self):
+        plan = analyze_question(self.instance)
+        hits = [
+            make_hit(
+                "s1",
+                text="2024-01-01 | Attended the Data Analysis using Python webinar.",
+                event_date="2024-01-01",
+                entities=["data analysis using python", "data analysis using python webinar"],
+            ),
+            make_hit(
+                "s2",
+                text="2024-01-05 | Attended the Effective Time Management workshop.",
+                event_date="2024-01-05",
+                entities=["effective time management", "effective time management workshop"],
+            ),
+        ]
+        result = solve_temporal_question(plan, hits)
+        self.assertTrue(result.resolved)
+        self.assertEqual(result.answer, "Data Analysis using Python")
+
+    def test_solve_temporal_question_difference_uses_question_date_for_ago(self):
+        instance = {
+            "question_id": "q-ago",
+            "question_type": "temporal-reasoning",
+            "question": "How many months ago did I book the Airbnb in San Francisco?",
+            "answer": "2 months",
+            "question_date": "2024/03/20 (Wed) 10:00",
+            "haystack_session_ids": [],
+            "haystack_dates": [],
+            "haystack_sessions": [],
+            "answer_session_ids": [],
+        }
+        plan = analyze_question(instance)
+        hits = [
+            make_hit(
+                "s1",
+                text="2024-01-05 | I booked the Airbnb in San Francisco.",
+                event_date="2024-01-05",
+                entities=["book the airbnb in san francisco", "airbnb in san francisco"],
+            )
+        ]
+        result = solve_temporal_question(plan, hits)
+        self.assertTrue(result.resolved)
+        self.assertEqual(result.answer, "2 months")
+
+    def test_solve_temporal_question_difference_uses_black_friday_anchor(self):
+        instance = {
+            "question_id": "q-black-friday",
+            "question_type": "temporal-reasoning",
+            "question": "How many days before I bought the iPhone 13 Pro did I attend the Holiday Market?",
+            "answer": "7 days",
+            "question_date": "2023/12/10 (Sun) 23:13",
+            "haystack_session_ids": [],
+            "haystack_dates": [],
+            "haystack_sessions": [],
+            "answer_session_ids": [],
+        }
+        plan = analyze_question(instance)
+        hits = [
+            make_hit(
+                "s1",
+                text="2023-11-17 | I attended the annual Holiday Market at the local mall.",
+                event_date="2023-11-17",
+                entities=["holiday market"],
+                date_confidence=0.86,
+                date_source="relative-before-black-friday",
+            ),
+            make_hit(
+                "s2",
+                text="2023-11-24 | I got my iPhone 13 Pro from Best Buy on Black Friday.",
+                event_date="2023-11-24",
+                entities=["iphone 13 pro"],
+                date_confidence=0.88,
+                date_source="named-anchor-black-friday",
+            ),
+        ]
+        result = solve_temporal_question(plan, hits)
+        self.assertTrue(result.resolved)
+        self.assertEqual(result.answer, "7 days")
 
     def test_postprocess_prediction_extracts_target_name(self):
         plan = analyze_question(self.instance)
@@ -263,6 +519,22 @@ class LongMemEvalHelpersTest(unittest.TestCase):
         }
         plan = analyze_question(instance)
         prediction = "You attended the first BBQ event in June on June 3rd."
+        self.assertEqual(postprocess_prediction(plan, prediction), "June 3")
+
+    def test_postprocess_prediction_extracts_day_month_date(self):
+        instance = {
+            "question_id": "q3b",
+            "question_type": "temporal-reasoning",
+            "question": "What was the date on which I attended the first BBQ event in June?",
+            "answer": "June 3rd",
+            "question_date": "2024/06/20 (Thu) 10:00",
+            "haystack_session_ids": [],
+            "haystack_dates": [],
+            "haystack_sessions": [],
+            "answer_session_ids": [],
+        }
+        plan = analyze_question(instance)
+        prediction = "You attended the first BBQ event in June on the 3rd of June."
         self.assertEqual(postprocess_prediction(plan, prediction), "June 3")
 
     def test_answerability_allows_global_timeline_backstop(self):
