@@ -1,29 +1,25 @@
-# Memory-Aware Local Inference Sandbox
+# Memory-Aware OpenAI Benchmark Sandbox
 
-This repository is a local experimentation workspace for:
+This repository is an experimentation workspace for:
 
-- small decoder-only language model training and sampling with PyTorch
 - a typed memory layer with retrieval, gating, reranking, and prompt assembly
-- Apple Silicon inference through `mlx-lm`
+- OpenAI API benchmarking on LongMemEval
 
-The core memory system leaves the base language model unchanged. It retrieves candidate memories from a local SQLite store, scores whether they should be used, and then injects only the selected memories into the prompt.
+The core memory system leaves the generator unchanged. It retrieves candidate memories from a local SQLite store, scores whether they should be used, and then injects only the selected memories into the prompt before sending the request to OpenAI.
 
 ## Layout
 
-- `train.py`, `model.py`, `sample.py`: baseline Torch training and sampling
 - `memory/`: memory store, embeddings, retrieval, critic, policies, explainability
 - `prompt/`: prompt assembly and budget selection
 - `memory_cli.py`: inspect and manage local memories
-- `sample_mlx.py`: Apple Silicon runner using `mlx-lm`
-- `benchmark_longmemeval.py`: run the local memory stack on the public LongMemEval benchmark
 - `benchmark_longmemeval_openai.py`: run the same benchmark with OpenAI as the generator
 
 ## Quick Start
 
-Install the Python dependencies you need inside the repo virtualenv. For the Apple Silicon path:
+Install the Python dependencies you need inside the repo virtualenv:
 
 ```sh
-./venv/bin/pip install mlx-lm
+./venv/bin/pip install httpx
 ```
 
 Seed a couple of memories:
@@ -48,35 +44,6 @@ Preview retrieval:
   --show-prompt
 ```
 
-Run the Apple Silicon path with the default MLX instruct model:
-
-```sh
-./venv/bin/python sample_mlx.py \
-  --start="Debug the memory retrieval bug in the inference project." \
-  --max_new_tokens=160 \
-  --temperature=0.3 \
-  --top_k=40 \
-  --memory_enabled=True \
-  --memory_db_path=memory.sqlite \
-  --memory_user_id=default \
-  --memory_explain=True
-```
-
-Run the public LongMemEval benchmark with the same MLX memory layer:
-
-```sh
-./venv/bin/python benchmark_longmemeval.py \
-  --dataset_path=data/longmemeval_oracle.json \
-  --max_examples=25 \
-  --output_path=reports/longmemeval_oracle_predictions.jsonl \
-  --details_path=reports/longmemeval_oracle_details.jsonl \
-  --summary_path=reports/longmemeval_oracle_summary.json \
-  --memory_enabled=True \
-  --memory_explain=False
-```
-
-`output_path` is intentionally compatible with the official LongMemEval evaluation script: each line contains only `question_id` and `hypothesis`. The companion `details_path` file includes local metrics such as exact match, token F1, selected memory count, and selected-session recall.
-
 Run the same benchmark with OpenAI as the generator while keeping retrieval and gating local:
 
 ```sh
@@ -92,25 +59,9 @@ export OPENAI_API_KEY=...
   --memory_enabled=True
 ```
 
+`output_path` is intentionally compatible with the official LongMemEval evaluation script: each line contains only `question_id` and `hypothesis`. The companion `details_path` file includes local metrics such as exact match, token F1, selected memory count, selected-session recall, and OpenAI token usage.
+
 To benchmark the hosted model without the memory layer, rerun with `--memory_enabled=False` and compare the two summary JSON files.
-
-Run the Torch sampler with the local memory layer:
-
-```sh
-./venv/bin/python sample.py \
-  --init_from=gpt2 \
-  --start="Explain the memory retrieval bug." \
-  --num_samples=1 \
-  --max_new_tokens=120 \
-  --temperature=0.2 \
-  --top_k=40 \
-  --device=cpu \
-  --compile=False \
-  --memory_enabled=True \
-  --memory_db_path=memory.sqlite \
-  --memory_user_id=default \
-  --memory_explain=True
-```
 
 ## Memory Layer
 
@@ -145,4 +96,4 @@ mkdir -p data
 curl -L https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_oracle.json -o data/longmemeval_oracle.json
 ```
 
-For quick validation, `longmemeval_oracle.json` is the easiest starting point because it contains only the evidence sessions. For harder retrieval stress tests, use `longmemeval_s_cleaned.json` or `longmemeval_m_cleaned.json` with the same runner.
+For quick validation, `longmemeval_oracle.json` is the easiest starting point because it contains only the evidence sessions. For harder retrieval stress tests, use `longmemeval_s_cleaned.json` or `longmemeval_m_cleaned.json` with the same OpenAI runner.

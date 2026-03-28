@@ -1,8 +1,8 @@
 """
 Run LongMemEval with the local memory-aware inference layer and OpenAI's Responses API.
 
-This keeps retrieval, gating, and prompt assembly local, but swaps the final
-generator from the local MLX model to an OpenAI-hosted model.
+This keeps retrieval, gating, and prompt assembly local while using an
+OpenAI-hosted model for generation.
 """
 from __future__ import annotations
 
