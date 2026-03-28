@@ -83,6 +83,49 @@ class LongMemEvalHelpersTest(unittest.TestCase):
         self.assertEqual(memories[0]["metadata"]["event_date"], "2024-01-01")
         self.assertEqual(memories[0]["metadata"]["granularity"], "fact")
 
+    def test_iter_history_memories_turn_granularity_prefers_explicit_turn_date(self):
+        instance = {
+            "question_id": "q-explicit",
+            "question_type": "temporal-reasoning",
+            "question": "When did I attend the workshop?",
+            "answer": "2023-01-10",
+            "question_date": "2023/01/20 (Fri) 10:00",
+            "haystack_session_ids": ["s1"],
+            "haystack_dates": ["2023/01/13 (Fri) 18:07"],
+            "haystack_sessions": [[
+                {
+                    "role": "user",
+                    "content": "I attended the workshop on January 10th before preparing for the team meeting.",
+                    "has_answer": True,
+                }
+            ]],
+            "answer_session_ids": ["s1"],
+        }
+        memories = list(iter_history_memories(instance, granularity="turn", include_assistant_turns=False))
+        self.assertEqual(memories[0]["metadata"]["event_date"], "2023-01-10")
+        self.assertIn("2023-01-10", memories[0]["text"])
+
+    def test_iter_history_memories_turn_granularity_derives_relative_date(self):
+        instance = {
+            "question_id": "q-relative",
+            "question_type": "temporal-reasoning",
+            "question": "When did I buy the coffee maker?",
+            "answer": "2023-05-01",
+            "question_date": "2023/05/25 (Thu) 10:00",
+            "haystack_session_ids": ["s1"],
+            "haystack_dates": ["2023/05/22 (Mon) 09:38"],
+            "haystack_sessions": [[
+                {
+                    "role": "user",
+                    "content": "I bought the coffee maker about three weeks ago and have been using it every morning since then.",
+                    "has_answer": True,
+                }
+            ]],
+            "answer_session_ids": ["s1"],
+        }
+        memories = list(iter_history_memories(instance, granularity="turn", include_assistant_turns=False))
+        self.assertEqual(memories[0]["metadata"]["event_date"], "2023-05-01")
+
     def test_iter_history_memories_session_granularity_yields_episode_memories(self):
         memories = list(
             iter_history_memories(
@@ -167,6 +210,88 @@ class LongMemEvalHelpersTest(unittest.TestCase):
         plan = analyze_question(self.instance)
         prediction = "You attended the Data Analysis using Python webinar first on 2024/01/01."
         self.assertEqual(postprocess_prediction(plan, prediction), "Data Analysis using Python")
+
+    def test_postprocess_prediction_extracts_target_with_internal_article(self):
+        instance = {
+            "question_id": "q4",
+            "question_type": "temporal-reasoning",
+            "question": "Which event happened first, the purchase of the coffee maker or the malfunction of the stand mixer?",
+            "answer": "The malfunction of the stand mixer",
+            "question_date": "2023/05/25 (Thu) 10:00",
+            "haystack_session_ids": [],
+            "haystack_dates": [],
+            "haystack_sessions": [],
+            "answer_session_ids": [],
+        }
+        plan = analyze_question(instance)
+        prediction = "Based on the evidence, the purchase of the coffee maker happened first."
+        self.assertEqual(postprocess_prediction(plan, prediction), "purchase of the coffee maker")
+
+    def test_postprocess_prediction_avoids_year_as_duration(self):
+        instance = {
+            "question_id": "q2",
+            "question_type": "temporal-reasoning",
+            "question": "How many days before the team meeting did I attend the workshop?",
+            "answer": "7 days",
+            "question_date": "2024/01/10 (Wed) 10:00",
+            "haystack_session_ids": [],
+            "haystack_dates": [],
+            "haystack_sessions": [],
+            "answer_session_ids": [],
+        }
+        plan = analyze_question(instance)
+        prediction = (
+            "On 2023-01-13, you mentioned preparing for the meeting.\n"
+            "Since there is no specific date for the workshop attendance, it is not possible to determine the exact number of days."
+        )
+        self.assertEqual(
+            postprocess_prediction(plan, prediction),
+            "Insufficient evidence",
+        )
+
+    def test_postprocess_prediction_extracts_month_day_date(self):
+        instance = {
+            "question_id": "q3",
+            "question_type": "temporal-reasoning",
+            "question": "What was the date on which I attended the first BBQ event in June?",
+            "answer": "June 3rd",
+            "question_date": "2024/06/20 (Thu) 10:00",
+            "haystack_session_ids": [],
+            "haystack_dates": [],
+            "haystack_sessions": [],
+            "answer_session_ids": [],
+        }
+        plan = analyze_question(instance)
+        prediction = "You attended the first BBQ event in June on June 3rd."
+        self.assertEqual(postprocess_prediction(plan, prediction), "June 3")
+
+    def test_answerability_allows_global_timeline_backstop(self):
+        plan = analyze_question(self.instance)
+        selected = [
+            make_hit(
+                "global",
+                memory_type="timeline",
+                granularity="timeline-global",
+                text="Global timeline evidence.",
+                event_date="2024-01-01",
+                entities=["data analysis using python", "effective time management workshop"],
+                score=0.95,
+            ),
+            make_hit(
+                "s1",
+                text="2024-01-01 | Attended the Data Analysis using Python webinar.",
+                event_date="2024-01-01",
+                entities=["data analysis using python webinar"],
+            ),
+            make_hit(
+                "s2",
+                text="2024-01-05 | Attended the Effective Time Management workshop.",
+                event_date="2024-01-05",
+                entities=["effective time management workshop"],
+            ),
+        ]
+        answerability = assess_answerability(plan, selected)
+        self.assertTrue(answerability["sufficient"])
 
     def test_summarize_records(self):
         summary = summarize_records(
