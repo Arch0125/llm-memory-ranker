@@ -81,6 +81,44 @@ def make_hit(
     )
 
 
+def make_aggregate_hit(
+    text="Aggregate memory",
+    aggregate_kind="count_distinct",
+    aggregate_answer="2",
+    aggregate_confidence=0.86,
+    entries=None,
+    score=0.95,
+    confidence=0.9,
+):
+    return MemoryHit(
+        record=MemoryRecord(
+            memory_id=f"agg-{aggregate_kind}",
+            user_id="u1",
+            memory_type="aggregate",
+            text=text,
+            created_at="2026-03-28T00:00:00+00:00",
+            last_accessed_at="2026-03-28T00:00:00+00:00",
+            importance=0.95,
+            metadata={
+                "granularity": "aggregate",
+                "summary": text,
+                "aggregate_kind": aggregate_kind,
+                "aggregate_answer": aggregate_answer,
+                "aggregate_confidence": aggregate_confidence,
+                "aggregate_mode": f"multi-session-{aggregate_kind}",
+                "aggregate_entries": entries or [],
+                "event_aliases": [],
+                "entities": [],
+            },
+        ),
+        score=score,
+        embedding_model="temporal-hash-512",
+        age_days=0,
+        critic_label="use",
+        critic_confidence=confidence,
+    )
+
+
 class LongMemEvalHelpersTest(unittest.TestCase):
     def setUp(self):
         self.instance = {
@@ -313,10 +351,31 @@ class LongMemEvalHelpersTest(unittest.TestCase):
         self.assertEqual(plan.reasoning_kind, "date")
         self.assertEqual(plan.filter_month, "06")
 
+    def test_analyze_question_multi_session_extracts_plan(self):
+        instance = {
+            "question_id": "q-multi",
+            "question_type": "multi-session",
+            "question": "How many different doctors have I visited in the last two months?",
+            "answer": "2",
+            "question_date": "2024/04/01 (Mon) 09:00",
+            "haystack_session_ids": [],
+            "haystack_dates": [],
+            "haystack_sessions": [],
+            "answer_session_ids": [],
+        }
+        plan = analyze_question(instance)
+        self.assertTrue(plan.is_multi_session)
+        self.assertFalse(plan.is_temporal)
+        self.assertEqual(plan.reasoning_kind, "multi-session")
+        self.assertEqual(plan.multi_session_kind, "count_distinct")
+        self.assertIn("doctor", plan.multi_session_focus_terms)
+
     def test_answer_metrics_support_acceptable_variants(self):
         self.assertEqual(normalize_answer("The Sushi!"), "sushi")
         self.assertEqual(acceptable_answers("7 days. 8 days (including the last day) is also acceptable."), ["7 days", "8 days"])
+        self.assertEqual(acceptable_answers(3), ["3"])
         self.assertEqual(exact_match_score("8 days", "7 days. 8 days (including the last day) is also acceptable."), 1.0)
+        self.assertEqual(exact_match_score("3", 3), 1.0)
         self.assertEqual(exact_match_score("June 3", "June 3rd"), 1.0)
         self.assertEqual(contains_match_score("The answer is sushi", "sushi"), 1.0)
         self.assertGreater(token_f1_score("the user prefers sushi", "sushi"), 0.0)
@@ -564,6 +623,116 @@ class LongMemEvalHelpersTest(unittest.TestCase):
         ]
         answerability = assess_answerability(plan, selected)
         self.assertTrue(answerability["sufficient"])
+
+    def test_iter_history_memories_hybrid_builds_multi_session_aggregate_memory(self):
+        instance = {
+            "question_id": "q-ms-agg",
+            "question_type": "multi-session",
+            "question": "How many different doctors have I visited in the last two months?",
+            "answer": "2",
+            "question_date": "2024/04/01 (Mon) 09:00",
+            "haystack_session_ids": ["s1", "s2"],
+            "haystack_dates": ["2024/03/12 (Tue) 10:00", "2024/03/22 (Fri) 11:00"],
+            "haystack_sessions": [
+                [{"role": "user", "content": "I visited Dr. Patel for a persistent cough.", "has_answer": True}],
+                [{"role": "user", "content": "I had an appointment with Dr. Chen for my skin rash.", "has_answer": True}],
+            ],
+            "answer_session_ids": ["s1", "s2"],
+        }
+        memories = list(iter_history_memories(instance, granularity="hybrid", include_assistant_turns=False))
+        aggregate = next(memory for memory in memories if memory["memory_type"] == "aggregate")
+        self.assertEqual(aggregate["metadata"]["aggregate_kind"], "count_distinct")
+        self.assertEqual(aggregate["metadata"]["aggregate_answer"], "2")
+
+    def test_select_bundled_hits_prefers_multi_session_aggregate(self):
+        instance = {
+            "question_id": "q-ms-select",
+            "question_type": "multi-session",
+            "question": "How many different doctors have I visited in the last two months?",
+            "answer": "2",
+            "question_date": "2024/04/01 (Mon) 09:00",
+            "haystack_session_ids": [],
+            "haystack_dates": [],
+            "haystack_sessions": [],
+            "answer_session_ids": [],
+        }
+        plan = analyze_question(instance)
+        aggregate = make_aggregate_hit(
+            text="Aggregate memory for multi-session doctor visits.",
+            aggregate_kind="count_distinct",
+            aggregate_answer="2",
+            aggregate_confidence=0.86,
+            entries=[
+                {"entry_id": "e1", "session_id": "s1", "event_date": "2024-03-12"},
+                {"entry_id": "e2", "session_id": "s2", "event_date": "2024-03-22"},
+            ],
+        )
+        facts = [
+            make_hit("s1", text="2024-03-12 | I visited Dr. Patel for a cough.", entities=["dr patel", "doctor"]),
+            make_hit("s2", text="2024-03-22 | I saw Dr. Chen about a rash.", entities=["dr chen", "doctor"]),
+        ]
+        selected, _ = select_bundled_hits(plan, [facts[0], aggregate, facts[1]], max_items=5, max_tokens=400, encode=None)
+        answerability = assess_answerability(plan, selected)
+        self.assertEqual(selected[0].record.memory_type, "aggregate")
+        self.assertTrue(answerability["sufficient"])
+
+    def test_solve_temporal_question_multi_session_uses_aggregate_answer(self):
+        instance = {
+            "question_id": "q-ms-money",
+            "question_type": "multi-session",
+            "question": "What is the total amount I spent on bike accessories this year?",
+            "answer": "$150",
+            "question_date": "2024/12/31 (Tue) 09:00",
+            "haystack_session_ids": [],
+            "haystack_dates": [],
+            "haystack_sessions": [],
+            "answer_session_ids": [],
+        }
+        plan = analyze_question(instance)
+        aggregate = make_aggregate_hit(
+            text="Aggregate memory for bike accessory spending.",
+            aggregate_kind="sum_money",
+            aggregate_answer="$150",
+            aggregate_confidence=0.88,
+            entries=[
+                {"entry_id": "e1", "session_id": "s1", "event_date": "2024-02-10"},
+                {"entry_id": "e2", "session_id": "s2", "event_date": "2024-05-03"},
+            ],
+        )
+        result = solve_temporal_question(plan, [aggregate])
+        self.assertTrue(result.resolved)
+        self.assertEqual(result.answer, "$150")
+
+    def test_solve_temporal_question_multi_session_falls_back_to_fact_entries(self):
+        instance = {
+            "question_id": "q-ms-fallback",
+            "question_type": "multi-session",
+            "question": "How many different doctors have I visited in the last two months?",
+            "answer": "2",
+            "question_date": "2024/04/01 (Mon) 09:00",
+            "haystack_session_ids": [],
+            "haystack_dates": [],
+            "haystack_sessions": [],
+            "answer_session_ids": [],
+        }
+        plan = analyze_question(instance)
+        hits = [
+            make_hit(
+                "s1",
+                text="2024-03-12 | I visited Dr. Patel for a persistent cough.",
+                event_date="2024-03-12",
+                entities=["doctor", "dr patel"],
+            ),
+            make_hit(
+                "s2",
+                text="2024-03-22 | I had an appointment with Dr. Chen for my skin rash.",
+                event_date="2024-03-22",
+                entities=["doctor", "dr chen"],
+            ),
+        ]
+        result = solve_temporal_question(plan, hits)
+        self.assertTrue(result.resolved)
+        self.assertEqual(result.answer, "2")
 
     def test_summarize_records(self):
         summary = summarize_records(

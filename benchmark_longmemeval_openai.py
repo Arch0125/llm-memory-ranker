@@ -81,7 +81,19 @@ def _build_baseline_instructions(plan, recent_context="", base_system_prompt=Non
     parts = [base_system_prompt or DEFAULT_SYSTEM_PROMPT]
     if recent_context:
         parts.append(f"Recent context:\n{recent_context.strip()}")
-    if plan.reasoning_kind == "ordering":
+    if plan.is_multi_session:
+        if plan.multi_session_kind in {"count_entries", "count_distinct"}:
+            parts.append("Return only the final number.")
+        elif plan.multi_session_kind == "sum_money":
+            parts.append("Return only the final total amount like '$120'.")
+        elif plan.multi_session_kind == "sum_quantity":
+            unit = plan.unit_hint or "units"
+            parts.append(f"Return only the final total like '12 {unit}'.")
+        elif plan.multi_session_kind == "time_lookup":
+            parts.append("Return only the final time.")
+        else:
+            parts.append("Return only the final answer.")
+    elif plan.reasoning_kind == "ordering":
         parts.append("Return only the event/item that happened first or last.")
     elif plan.reasoning_kind == "difference":
         unit = plan.unit_hint or "days"
@@ -124,11 +136,13 @@ def _make_memory_system(store, embedder, policy):
 
 
 def _solver_allowed_reasoning_kind(plan):
-    return plan.reasoning_kind in {"ordering", "date"}
+    return plan.reasoning_kind in {"ordering", "date"} or plan.is_multi_session
 
 
 def _structured_events_for_prompt(plan, structured_events, solver_result):
     if not structured_events:
+        return []
+    if plan.is_multi_session:
         return []
     if not _solver_allowed_reasoning_kind(plan):
         return []

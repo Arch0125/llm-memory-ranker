@@ -51,6 +51,19 @@ TEMPORAL_CUES = {
     "when",
 }
 
+MULTI_SESSION_CUES = {
+    "count",
+    "current",
+    "currently",
+    "different",
+    "doctor",
+    "how",
+    "many",
+    "spent",
+    "time",
+    "total",
+}
+
 
 def _overlap_features(query_text, memory_text):
     query_tokens = set(tokenize(query_text))
@@ -87,6 +100,11 @@ class HeuristicCritic:
         continuation = bool(query_tokens & CONTINUATION_CUES)
         constraint_request = bool(query_tokens & CONSTRAINT_CUES)
         temporal_request = bool(query_tokens & TEMPORAL_CUES)
+        multi_session_request = (
+            "how many" in query_text.lower()
+            or "total" in query_text.lower()
+            or bool(query_tokens & MULTI_SESSION_CUES)
+        )
         recency = 1.0 if hit.age_days <= 14 else max(0.0, 1.0 - (hit.age_days / 180.0))
         type_name = hit.record.memory_type
         importance = hit.record.importance
@@ -123,6 +141,12 @@ class HeuristicCritic:
             base = overlap
             if temporal_request and has_event_date:
                 base = max(base, 0.72 if entity_overlap > 0.0 else 0.56)
+        elif type_name == "aggregate":
+            base = overlap * 0.9
+            if multi_session_request:
+                base = max(base, 0.72)
+            base += 0.18 * alias_overlap
+            base += 0.12 * float(hit.record.metadata.get("aggregate_confidence", 0.0) or 0.0)
         elif type_name in {"constraint", "safety"}:
             base = max(overlap, 0.75 if constraint_request and lexical_anchor else 0.0)
         elif type_name == "identity":
@@ -155,6 +179,8 @@ class HeuristicCritic:
         )
         if temporal_request:
             confidence = clamp(confidence + (0.10 * entity_overlap) + (0.08 * alias_overlap) + (0.06 if has_event_date else 0.0) + (0.05 * date_confidence))
+        if type_name == "aggregate" and multi_session_request:
+            confidence = clamp(confidence + 0.08 + (0.06 * float(hit.record.metadata.get("aggregate_confidence", 0.0) or 0.0)))
 
         reasons = []
         if shared_tokens:
@@ -171,6 +197,8 @@ class HeuristicCritic:
             reasons.append("constraint-cue")
         if temporal_request:
             reasons.append("temporal-cue")
+        if multi_session_request:
+            reasons.append("multi-session-cue")
         if has_event_date:
             reasons.append("dated")
         if date_confidence > 0.0:
@@ -181,7 +209,7 @@ class HeuristicCritic:
             reasons.append("covers-query")
 
         if confidence >= self.use_threshold and (
-            has_shared or entity_overlap > 0.0 or type_name in {"constraint", "safety", "timeline"}
+            has_shared or entity_overlap > 0.0 or type_name in {"constraint", "safety", "timeline", "aggregate"}
         ):
             return CriticDecision(label="use", confidence=confidence, reasons=reasons)
         if confidence >= self.maybe_threshold and (has_shared or entity_overlap > 0.0 or temporal_request):

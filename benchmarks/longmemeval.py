@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
 from memory.utils import (
+    STOPWORDS,
     extract_entities,
     normalize_date,
     preview,
@@ -96,6 +97,21 @@ _DAY_MONTH_RE = re.compile(
 _DATE_LINE_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
 _MONTH_DIFF_RE = re.compile(r"\b(\d+)\s*(month|months)\b", re.IGNORECASE)
 _DAY_DIFF_RE = re.compile(r"\b(\d+)\s*(day|days)\b", re.IGNORECASE)
+_MONEY_RE = re.compile(r"\$(\d+(?:,\d{3})*(?:\.\d+)?)")
+_QUANTITY_RE = re.compile(
+    r"\b(\d+(?:\.\d+)?)\s*(hours?|days?|weeks?|months?|years?|pages?)\b",
+    re.IGNORECASE,
+)
+_TIME_OF_DAY_RE = re.compile(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", re.IGNORECASE)
+_DOCTOR_RE = re.compile(r"\bDr\.?\s+([A-Z][a-z]+)\b")
+_LAST_WEEKDAY_RE = re.compile(
+    r"\blast\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+    re.IGNORECASE,
+)
+_THIS_WEEKDAY_RE = re.compile(
+    r"\bthis\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+    re.IGNORECASE,
+)
 _RELATIVE_SPAN_RE = re.compile(
     r"\b(?:about|around|approximately|roughly)?\s*(\d+|a|an|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+"
     r"(day|days|week|weeks|month|months|year|years)\s+ago\b",
@@ -120,6 +136,23 @@ _TRAILING_RELATIVE_FRAGMENT_RE = re.compile(
     r"(?:day|days|week|weeks|month|months|year|years)\b.*$",
     re.IGNORECASE,
 )
+_MULTI_HOW_MANY_RE = re.compile(
+    r"^how many\s+(.+?)\s+(?:do|did|have|has|am|are|were|will|can)\s+i\s+(.+)$",
+    re.IGNORECASE,
+)
+_MULTI_TOTAL_SPENT_RE = re.compile(
+    r"^(?:what is the total amount i spent on|how much total money have i spent on)\s+(.+)$",
+    re.IGNORECASE,
+)
+_MULTI_TOTAL_RE = re.compile(
+    r"^(?:how many|how much)\s+(.+?)\s+in total\b",
+    re.IGNORECASE,
+)
+_MULTI_TIME_RE = re.compile(r"^what time did i\s+(.+)$", re.IGNORECASE)
+_MULTI_MAX_RE = re.compile(
+    r"^(which\s+.+?)\s+did\s+i\s+(.+?\bthe most)\b.*$",
+    re.IGNORECASE,
+)
 
 _NUMBER_WORDS = {
     "a": 1,
@@ -136,6 +169,56 @@ _NUMBER_WORDS = {
     "ten": 10,
     "eleven": 11,
     "twelve": 12,
+}
+_WEEKDAY_TO_INDEX = {
+    "monday": 0,
+    "tuesday": 1,
+    "wednesday": 2,
+    "thursday": 3,
+    "friday": 4,
+    "saturday": 5,
+    "sunday": 6,
+}
+_MULTI_GENERIC_TOKENS = STOPWORDS | {
+    "different",
+    "current",
+    "currently",
+    "everything",
+    "including",
+    "last",
+    "past",
+    "since",
+    "start",
+    "total",
+    "totally",
+    "year",
+    "month",
+    "months",
+    "week",
+    "weeks",
+    "day",
+    "days",
+    "time",
+    "times",
+    "amount",
+    "money",
+    "spent",
+    "take",
+    "took",
+    "before",
+    "after",
+}
+_CATEGORY_HINTS = {
+    "clothing": {"clothing", "clothes", "blazer", "shirt", "jeans", "boots", "dress", "sundress", "pants", "scarf", "gloves", "dry", "cleaning"},
+    "doctor": {"doctor", "dr", "physician", "specialist", "dermatologist", "appointment", "ent"},
+    "project": {"project", "research", "analysis", "competition", "presentation", "poster"},
+    "model": {"model", "kit", "spitfire", "bomber", "camaro", "tank", "eagle"},
+    "bike": {"bike", "helmet", "lights", "chain", "rack", "service", "serviced", "tune", "tuneup"},
+    "instrument": {"instrument", "guitar", "drum", "piano", "violin", "keyboard"},
+    "wedding": {"wedding", "couple"},
+    "festival": {"festival"},
+    "museum": {"museum", "gallery"},
+    "grocery": {"grocery", "store", "market"},
 }
 _MONTHS = {
     "jan": 1,
@@ -196,6 +279,15 @@ class QuestionPlan:
     question_month: str
     ordering_direction: str
     filter_month: str
+    is_multi_session: bool
+    multi_session_kind: str
+    multi_session_subject: str
+    multi_session_actions: list[str]
+    multi_session_focus_terms: list[str]
+    range_start: str
+    range_end: str
+    requires_distinct: bool
+    requires_current_state: bool
 
 
 @dataclass
@@ -236,8 +328,17 @@ def _clean_answer_variant(text):
     return value
 
 
+def _coerce_text(value):
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
 def acceptable_answers(answer):
-    parts = re.split(r"\.\s+", answer or "")
+    answer_text = _coerce_text(answer)
+    parts = re.split(r"\.\s+", answer_text)
     variants = []
     seen = set()
     for part in parts:
@@ -248,8 +349,8 @@ def acceptable_answers(answer):
         if normalized and normalized not in seen:
             seen.add(normalized)
             variants.append(cleaned)
-    if not variants and (answer or "").strip():
-        variants.append((answer or "").strip())
+    if not variants and answer_text.strip():
+        variants.append(answer_text.strip())
     return variants
 
 
@@ -387,6 +488,216 @@ def _parse_numeric_token(value):
     return _NUMBER_WORDS.get(token)
 
 
+def _parse_amount_token(value):
+    token = _coerce_text(value).replace(",", "").strip()
+    try:
+        return float(token)
+    except ValueError:
+        return None
+
+
+def _format_numeric_value(value):
+    if value is None:
+        return ""
+    if float(value).is_integer():
+        return str(int(value))
+    return str(round(float(value), 2)).rstrip("0").rstrip(".")
+
+
+def _weekday_relative_date(base_date, weekday_name, qualifier):
+    if base_date is None:
+        return None
+    weekday_index = _WEEKDAY_TO_INDEX.get((weekday_name or "").lower())
+    if weekday_index is None:
+        return None
+    delta = (base_date.weekday() - weekday_index) % 7
+    if qualifier == "last":
+        delta = 7 if delta == 0 else delta
+    else:
+        delta = 0 if delta == 0 else delta
+    return base_date - timedelta(days=delta)
+
+
+def _extract_currency_values(text):
+    values = []
+    for match in _MONEY_RE.finditer(text or ""):
+        amount = _parse_amount_token(match.group(1))
+        if amount is None:
+            continue
+        values.append(
+            {
+                "value": amount,
+                "raw": match.group(0),
+            }
+        )
+    return values
+
+
+def _extract_quantity_values(text):
+    values = []
+    for match in _QUANTITY_RE.finditer(text or ""):
+        amount = _parse_amount_token(match.group(1))
+        if amount is None:
+            continue
+        values.append(
+            {
+                "value": amount,
+                "unit": match.group(2).lower(),
+                "raw": match.group(0),
+            }
+        )
+    return values
+
+
+def _extract_clock_times(text):
+    values = []
+    for match in _TIME_OF_DAY_RE.finditer(text or ""):
+        hour = int(match.group(1))
+        minute = int(match.group(2) or 0)
+        meridiem = match.group(3).upper()
+        values.append(
+            {
+                "text": f"{hour}:{minute:02d} {meridiem}" if minute else f"{hour} {meridiem}",
+                "hour": hour,
+                "minute": minute,
+                "meridiem": meridiem,
+            }
+        )
+    return values
+
+
+def _extract_doctor_names(text):
+    seen = set()
+    values = []
+    for match in _DOCTOR_RE.finditer(text or ""):
+        name = f"Dr. {match.group(1)}"
+        normalized = normalize_answer(name)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        values.append(name)
+    lowered = (text or "").lower()
+    role_map = {
+        "primary care physician": "primary care physician",
+        "ent specialist": "ENT specialist",
+        "dermatologist": "dermatologist",
+    }
+    for needle, label in role_map.items():
+        if needle in lowered and normalize_answer(label) not in seen:
+            seen.add(normalize_answer(label))
+            values.append(label)
+    return values
+
+
+def _expand_focus_terms(subject, question):
+    terms = []
+    for token in normalize_answer(" ".join([subject, question])).split():
+        if token in _MULTI_GENERIC_TOKENS or len(token) < 3:
+            continue
+        if token not in terms:
+            terms.append(token)
+    lowered = normalize_answer(" ".join([subject, question]))
+    for trigger, extra in _CATEGORY_HINTS.items():
+        if trigger in lowered:
+            for token in sorted(extra):
+                if token not in terms:
+                    terms.append(token)
+    return terms
+
+
+def _multi_session_window(question, normalized_question_date):
+    base_date = _parse_iso_date(normalized_question_date)
+    if base_date is None:
+        return "", ""
+    lowered = question.lower()
+    start = ""
+    end = normalized_question_date
+    if "since the start of the year" in lowered or "this year" in lowered:
+        start = date(base_date.year, 1, 1).isoformat()
+    elif "last two months" in lowered or "past two months" in lowered:
+        start = _subtract_months(base_date, 2).isoformat()
+    elif "last month" in lowered or "past month" in lowered or "in the last month" in lowered:
+        start = _subtract_months(base_date, 1).isoformat()
+    elif "last two weeks" in lowered:
+        start = (base_date - timedelta(days=14)).isoformat()
+    elif "last week" in lowered or "past week" in lowered:
+        start = (base_date - timedelta(days=7)).isoformat()
+    elif "past few months" in lowered or "last few months" in lowered:
+        start = _subtract_months(base_date, 3).isoformat()
+    month_match = _IN_MONTH_RE.search(question)
+    if month_match:
+        month_value = _MONTHS[month_match.group(1).lower()]
+        range_start = date(base_date.year, month_value, 1)
+        range_end = date(base_date.year, month_value, monthrange(base_date.year, month_value)[1])
+        start = range_start.isoformat()
+        end = range_end.isoformat()
+    return start, end
+
+
+def _analyze_multi_session(question, normalized_question_date):
+    lowered = question.lower().strip(" ?.")
+    subject = ""
+    actions = []
+    kind = "open"
+    requires_distinct = "different" in lowered
+    requires_current_state = any(token in lowered for token in ("currently", "current", "currently own", "currently have"))
+
+    if match := _MULTI_TIME_RE.match(lowered):
+        subject = match.group(1)
+        kind = "time_lookup"
+    elif match := _MULTI_TOTAL_SPENT_RE.match(lowered):
+        subject = match.group(1)
+        actions = ["spent"]
+        kind = "sum_money"
+    elif lowered.startswith("how much more did i spend on"):
+        subject = lowered.replace("how much more did i spend on", "", 1).strip()
+        actions = ["spent"]
+        kind = "sum_money"
+    elif match := _MULTI_HOW_MANY_RE.match(lowered):
+        subject = match.group(1)
+        actions = [part.strip() for part in re.split(r"\bor\b|\band\b|,", match.group(2)) if part.strip()]
+        if requires_distinct:
+            kind = "count_distinct"
+        elif any(unit in lowered for unit in ("hours", "days", "weeks", "months", "years", "pages")):
+            kind = "sum_quantity"
+        else:
+            kind = "count_entries"
+    elif match := _MULTI_TOTAL_RE.match(lowered):
+        subject = match.group(1)
+        kind = "sum_quantity"
+    elif match := _MULTI_MAX_RE.match(lowered):
+        subject = match.group(1)
+        actions = [match.group(2)]
+        kind = "max_value"
+
+    if not subject:
+        subject = lowered
+    subject = _clean_question_clause(subject)
+    focus_terms = _expand_focus_terms(subject, question)
+    range_start, range_end = _multi_session_window(question, normalized_question_date)
+    return {
+        "kind": kind,
+        "subject": subject,
+        "actions": actions,
+        "focus_terms": focus_terms,
+        "range_start": range_start,
+        "range_end": range_end,
+        "requires_distinct": requires_distinct,
+        "requires_current_state": requires_current_state,
+    }
+
+
+def _infer_quantity_unit(question):
+    lowered = question.lower()
+    for unit in ("hours", "days", "weeks", "months", "years", "pages"):
+        if re.search(rf"\b{unit}\b", lowered):
+            return unit
+    for unit in ("hour", "day", "week", "month", "year", "page"):
+        if re.search(rf"\b{unit}\b", lowered):
+            return unit + "s"
+    return ""
+
+
 def _derive_event_date_candidates(text, session_date):
     base_date = _parse_iso_date(normalize_date(session_date))
     if not text:
@@ -506,6 +817,14 @@ def _derive_event_date_candidates(text, session_date):
             if anchor_name in lowered:
                 anchor = _named_anchor_date(anchor_name, base_date)
                 add_date(anchor, f"named-anchor-{anchor_name.replace(' ', '-')}", 0.88)
+
+        for match in _LAST_WEEKDAY_RE.finditer(text):
+            derived = _weekday_relative_date(base_date, match.group(1), "last")
+            add_date(derived, f"relative-last-{match.group(1).lower()}", 0.82)
+
+        for match in _THIS_WEEKDAY_RE.finditer(text):
+            derived = _weekday_relative_date(base_date, match.group(1), "this")
+            add_date(derived, f"relative-this-{match.group(1).lower()}", 0.78)
 
         if "yesterday" in lowered:
             add_date(base_date - timedelta(days=1), "relative-yesterday", 0.82)
@@ -830,6 +1149,15 @@ def _build_fact_memory_text(content, event_meta, session_date):
     return " | ".join(parts)
 
 
+def _aggregate_labels(content, event_meta, entities):
+    values = []
+    for item in event_meta.get("event_items", []):
+        values.append(item.get("label", ""))
+        values.extend(item.get("aliases", [])[:3])
+    values.extend(entities)
+    return _dedupe_preserve(values)[:12]
+
+
 def _session_entities(session):
     entities = []
     seen = set()
@@ -948,6 +1276,7 @@ def _build_fact_memories(session_id, session_date, session, include_assistant_tu
         )
         date_value = event_meta["event_date"]
         fact_text = _build_fact_memory_text(content, event_meta, session_date)
+        aggregate_labels = _aggregate_labels(content, event_meta, entities)
         yield {
             "text": fact_text,
             "memory_type": "event",
@@ -966,11 +1295,421 @@ def _build_fact_memories(session_id, session_date, session, include_assistant_tu
                 "granularity": "fact",
                 "event_items": event_meta["event_items"],
                 "event_aliases": event_meta["event_aliases"],
+                "aggregate_labels": aggregate_labels,
+                "currency_values": _extract_currency_values(content),
+                "quantity_values": _extract_quantity_values(content),
+                "clock_times": _extract_clock_times(content),
+                "doctor_names": _extract_doctor_names(content),
                 "date_source": event_meta["date_source"],
                 "date_confidence": event_meta["date_confidence"],
                 "date_candidates": event_meta["date_candidates"],
             },
         }
+
+
+def _normalize_unit(unit):
+    lowered = _coerce_text(unit).lower().strip()
+    if lowered.endswith("s"):
+        lowered = lowered[:-1]
+    return lowered
+
+
+def _entry_in_range(entry, plan):
+    if not plan.range_start and not plan.range_end:
+        return True
+    entry_date = _parse_iso_date(entry.get("event_date", ""))
+    if entry_date is None:
+        return False
+    if plan.range_start:
+        start = _parse_iso_date(plan.range_start)
+        if start is not None and entry_date < start:
+            return False
+    if plan.range_end:
+        end = _parse_iso_date(plan.range_end)
+        if end is not None and entry_date > end:
+            return False
+    return True
+
+
+def _extract_action_objects(text, actions):
+    lowered = _collapse(text).lower()
+    values = []
+    for action in actions:
+        action = action.strip().lower()
+        if not action:
+            continue
+        pattern = re.compile(
+            rf"\b{re.escape(action)}\s+(?:my|the|a|an|some|this|that|these|those)?\s*(.+?)(?:\s+(?:to|from|at|for|with|on)\b|[.,;!?]|$)",
+            re.IGNORECASE,
+        )
+        for match in pattern.finditer(lowered):
+            phrase = _cleanup_event_surface(match.group(1))
+            if phrase in {"it", "them", "one", "pair"} or len(phrase) < 2:
+                continue
+            value = f"{action}:{phrase}"
+            if value not in values:
+                values.append(value)
+    return values
+
+
+def _build_multi_session_entries(fact_memories):
+    entries = []
+    for index, memory in enumerate(fact_memories):
+        metadata = memory["metadata"]
+        entries.append(
+            {
+                "entry_id": f"entry-{index}",
+                "session_id": metadata.get("session_id"),
+                "event_date": metadata.get("event_date") or normalize_date(metadata.get("session_date", "")),
+                "session_date": normalize_date(metadata.get("session_date", "")),
+                "text": metadata.get("fact_text", memory["text"]),
+                "labels": metadata.get("aggregate_labels", []),
+                "event_aliases": metadata.get("event_aliases", []),
+                "entities": metadata.get("entities", []),
+                "currency_values": metadata.get("currency_values", []),
+                "quantity_values": metadata.get("quantity_values", []),
+                "clock_times": metadata.get("clock_times", []),
+                "doctor_names": metadata.get("doctor_names", []),
+                "memory_text": memory["text"],
+                "importance": memory["importance"],
+                "has_answer": metadata.get("has_answer", False),
+            }
+        )
+    return entries
+
+
+def _multi_session_text_blob(entry):
+    return normalize_answer(
+        " ".join(
+            [
+                entry.get("text", ""),
+                " ".join(entry.get("labels", [])),
+                " ".join(entry.get("event_aliases", [])),
+                " ".join(entry.get("entities", [])),
+                " ".join(entry.get("doctor_names", [])),
+            ]
+        )
+    )
+
+
+def _multi_session_entry_score(plan, entry):
+    text_blob = _multi_session_text_blob(entry)
+    score = 0.0
+    focus_matches = sum(1 for token in plan.multi_session_focus_terms if token in text_blob)
+    score += 0.42 * focus_matches
+    for action in plan.multi_session_actions:
+        normalized_action = normalize_answer(action)
+        if normalized_action and normalized_action in text_blob:
+            score += 0.55
+    if entry.get("has_answer"):
+        score += 0.15
+    if _entry_in_range(entry, plan):
+        score += 0.2
+    elif plan.range_start or plan.range_end:
+        score -= 0.4
+    if plan.multi_session_kind == "sum_money" and entry.get("currency_values"):
+        score += 1.2
+    if plan.multi_session_kind == "sum_quantity":
+        matching_quantities = [
+            item for item in entry.get("quantity_values", [])
+            if not plan.unit_hint or _normalize_unit(item.get("unit")) == _normalize_unit(plan.unit_hint)
+        ]
+        if matching_quantities:
+            score += 1.1
+    if plan.multi_session_kind == "time_lookup" and entry.get("clock_times"):
+        score += 0.9
+    if plan.requires_distinct and (
+        entry.get("doctor_names")
+        or entry.get("entities")
+        or entry.get("labels")
+    ):
+        score += 0.4
+    if plan.requires_current_state and any(token in text_blob for token in ("current", "currently", "still", "use", "own", "have")):
+        score += 0.3
+    return score
+
+
+def _entry_display_key(plan, entry):
+    action_objects = _extract_action_objects(entry.get("text", ""), plan.multi_session_actions)
+    if action_objects:
+        return action_objects[0]
+    if plan.multi_session_kind == "count_distinct" and entry.get("doctor_names"):
+        return entry["doctor_names"][0]
+    for source in (entry.get("labels", []), entry.get("event_aliases", []), entry.get("entities", [])):
+        for value in source:
+            normalized = normalize_answer(value)
+            if not normalized:
+                continue
+            if any(token in normalized for token in plan.multi_session_focus_terms) or len(source) == 1:
+                return value
+    return _trim(entry.get("text", ""), limit=72)
+
+
+def _distinct_values_for_entry(plan, entry):
+    values = []
+    if "doctor" in plan.multi_session_subject:
+        doctor_names = list(entry.get("doctor_names", []))
+        if not doctor_names:
+            doctor_names = _extract_doctor_names(entry.get("text", ""))
+        if doctor_names:
+            return doctor_names
+    action_objects = _extract_action_objects(entry.get("text", ""), plan.multi_session_actions)
+    if action_objects:
+        return action_objects
+    for source in (entry.get("labels", []), entry.get("event_aliases", []), entry.get("entities", [])):
+        for value in source:
+            normalized = normalize_answer(value)
+            if not normalized:
+                continue
+            if normalized in {"doctor", "doctors", "dr"}:
+                continue
+            if any(token in normalized for token in plan.multi_session_focus_terms):
+                values.append(value)
+    return _dedupe_preserve(values)
+
+
+def _format_money(amount):
+    if amount is None:
+        return ""
+    if float(amount).is_integer():
+        return f"${int(amount)}"
+    return f"${amount:.2f}".rstrip("0").rstrip(".")
+
+
+def _summarize_multi_session_entry(plan, entry):
+    parts = [f"date={entry.get('event_date') or 'unknown'}", f"source={entry.get('session_id') or 'unknown'}"]
+    if entry.get("currency_values"):
+        parts.append("money=" + ",".join(item["raw"] for item in entry["currency_values"][:3]))
+    if entry.get("quantity_values"):
+        parts.append("qty=" + ",".join(item["raw"] for item in entry["quantity_values"][:3]))
+    if entry.get("clock_times"):
+        parts.append("times=" + ",".join(item["text"] for item in entry["clock_times"][:2]))
+    key = _entry_display_key(plan, entry)
+    parts.append(f"key={preview(key, limit=72)}")
+    parts.append(f"evidence={preview(entry.get('text', ''), limit=140)}")
+    return " ; ".join(parts)
+
+
+def _solve_multi_session_from_entries(plan, entries):
+    relevant = [entry for entry in entries if entry.get("score", 0.0) > 0.55]
+    if not relevant:
+        relevant = entries[:8]
+    if not relevant:
+        return TemporalSolution(False, "", 0.0, "no-relevant-entries", "insufficient", [], [])
+
+    if plan.multi_session_kind == "sum_money":
+        seen = set()
+        values = []
+        supporting = []
+        for entry in relevant:
+            key = normalize_answer(_entry_display_key(plan, entry))
+            for item in entry.get("currency_values", []):
+                dedupe_key = (key, item["raw"])
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                values.append(item["value"])
+                supporting.append(entry)
+        if values:
+            total = sum(values)
+            return TemporalSolution(
+                True,
+                _format_money(total),
+                0.86 if len(values) >= 2 else 0.72,
+                "sum-money",
+                "multi-session-sum-money",
+                [entry["entry_id"] for entry in supporting[:8]],
+                [entry.get("event_date", "") for entry in supporting[:8]],
+            )
+
+    if plan.multi_session_kind == "sum_quantity":
+        unit = _normalize_unit(plan.unit_hint or "")
+        seen = set()
+        values = []
+        supporting = []
+        for entry in relevant:
+            key = normalize_answer(_entry_display_key(plan, entry))
+            for item in entry.get("quantity_values", []):
+                if unit and _normalize_unit(item.get("unit")) != unit:
+                    continue
+                dedupe_key = (key, item["raw"])
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                values.append(item["value"])
+                supporting.append(entry)
+        if values:
+            total = sum(values)
+            answer_unit = plan.unit_hint or (relevant[0].get("quantity_values", [{}])[0].get("unit", "") if relevant else "")
+            return TemporalSolution(
+                True,
+                f"{_format_numeric_value(total)} {answer_unit}".strip(),
+                0.82 if len(values) >= 2 else 0.68,
+                "sum-quantity",
+                "multi-session-sum-quantity",
+                [entry["entry_id"] for entry in supporting[:8]],
+                [entry.get("event_date", "") for entry in supporting[:8]],
+            )
+
+    if plan.multi_session_kind == "time_lookup":
+        appointment_entries = [
+            entry for entry in relevant
+            if "appointment" in _multi_session_text_blob(entry) and ("doctor" in _multi_session_text_blob(entry) or entry.get("doctor_names"))
+        ]
+        sleep_entries = [
+            entry for entry in relevant
+            if any(token in _multi_session_text_blob(entry) for token in ("bed", "sleep"))
+            and entry.get("clock_times")
+        ]
+        for appointment in appointment_entries:
+            appointment_date = _parse_iso_date(appointment.get("event_date", ""))
+            if appointment_date is None:
+                continue
+            for sleep in sleep_entries:
+                sleep_date = _parse_iso_date(sleep.get("event_date", ""))
+                if sleep_date is None:
+                    continue
+                if sleep_date == appointment_date - timedelta(days=1):
+                    return TemporalSolution(
+                        True,
+                        sleep["clock_times"][0]["text"].replace(":00", ""),
+                        0.88,
+                        "time-before-appointment",
+                        "multi-session-time-lookup",
+                        [sleep["entry_id"], appointment["entry_id"]],
+                        [sleep.get("event_date", ""), appointment.get("event_date", "")],
+                    )
+
+    if plan.multi_session_kind == "count_distinct":
+        distinct = []
+        seen = set()
+        supporting = []
+        for entry in relevant:
+            for value in _distinct_values_for_entry(plan, entry):
+                normalized = normalize_answer(value)
+                if not normalized or normalized in seen:
+                    continue
+                seen.add(normalized)
+                distinct.append(value)
+                supporting.append(entry)
+        if distinct:
+            return TemporalSolution(
+                True,
+                str(len(distinct)),
+                0.68 if len(distinct) >= 2 else 0.58,
+                "count-distinct",
+                "multi-session-count-distinct",
+                [entry["entry_id"] for entry in supporting[:8]],
+                [entry.get("event_date", "") for entry in supporting[:8]],
+            )
+
+    if plan.multi_session_kind == "count_entries":
+        distinct = []
+        seen = set()
+        supporting = []
+        for entry in relevant:
+            values = _extract_action_objects(entry.get("text", ""), plan.multi_session_actions)
+            if not values:
+                values = _distinct_values_for_entry(plan, entry)[:1]
+            for value in values:
+                normalized = normalize_answer(value)
+                if not normalized or normalized in seen:
+                    continue
+                seen.add(normalized)
+                distinct.append(value)
+                supporting.append(entry)
+        if distinct:
+            return TemporalSolution(
+                True,
+                str(len(distinct)),
+                0.62 if len(distinct) >= 2 else 0.52,
+                "count-entries",
+                "multi-session-count-entries",
+                [entry["entry_id"] for entry in supporting[:8]],
+                [entry.get("event_date", "") for entry in supporting[:8]],
+            )
+
+    return TemporalSolution(False, "", 0.0, "no-deterministic-multi-session-answer", "open", [], [])
+
+
+def _build_multi_session_aggregate_memories(instance, plan, fact_memories):
+    if not plan.is_multi_session:
+        return []
+    entries = _build_multi_session_entries(fact_memories)
+    for entry in entries:
+        entry["score"] = _multi_session_entry_score(plan, entry)
+    entries.sort(key=lambda item: (item["score"], item.get("event_date", ""), item.get("has_answer", False)), reverse=True)
+    relevant = [entry for entry in entries if entry["score"] > 0.55]
+    if not relevant:
+        relevant = entries[: min(8, len(entries))]
+    if not relevant:
+        return []
+
+    solution = _solve_multi_session_from_entries(plan, relevant)
+    summary_lines = [
+        f"Aggregate memory for multi-session question: {plan.question}",
+        f"Aggregation kind: {plan.multi_session_kind}",
+        f"Focus: {plan.multi_session_subject or plan.question}",
+    ]
+    if plan.range_start or plan.range_end:
+        summary_lines.append(f"Window: {plan.range_start or 'start'} to {plan.range_end or 'end'}")
+    if solution.resolved:
+        summary_lines.append(
+            f"Derived answer candidate: {solution.answer} (confidence={solution.confidence:.2f}, mode={solution.mode})"
+        )
+    summary_lines.append("Relevant evidence:")
+    for index, entry in enumerate(relevant[:8], start=1):
+        summary_lines.append(f"{index}. {_summarize_multi_session_entry(plan, entry)}")
+
+    supporting_sessions = []
+    seen_sessions = set()
+    for entry in relevant:
+        session_id = entry.get("session_id")
+        if session_id and session_id not in seen_sessions:
+            seen_sessions.add(session_id)
+            supporting_sessions.append(session_id)
+
+    return [
+        {
+            "text": "\n".join(summary_lines),
+            "memory_type": "aggregate",
+            "importance": 0.99 if solution.resolved else 0.9,
+            "metadata": {
+                "question_id": instance.get("question_id"),
+                "session_ids": supporting_sessions,
+                "session_date": plan.range_end or plan.normalized_question_date,
+                "event_date": plan.range_end or plan.normalized_question_date,
+                "event_dates": [entry.get("event_date", "") for entry in relevant if entry.get("event_date")],
+                "entities": plan.query_entities,
+                "activity_type": "aggregate",
+                "summary": _trim(" ".join(summary_lines), limit=240),
+                "granularity": "aggregate",
+                "event_items": [],
+                "event_aliases": _dedupe_preserve([plan.multi_session_subject] + plan.multi_session_focus_terms),
+                "date_source": "aggregate-window",
+                "date_confidence": 0.72 if solution.resolved else 0.5,
+                "date_candidates": [],
+                "aggregate_kind": plan.multi_session_kind,
+                "aggregate_answer": solution.answer,
+                "aggregate_confidence": solution.confidence,
+                "aggregate_mode": solution.mode,
+                "aggregate_entries": [
+                    {
+                        "entry_id": entry["entry_id"],
+                        "session_id": entry.get("session_id"),
+                        "event_date": entry.get("event_date"),
+                        "display_key": _entry_display_key(plan, entry),
+                        "currency_values": entry.get("currency_values", []),
+                        "quantity_values": entry.get("quantity_values", []),
+                        "clock_times": entry.get("clock_times", []),
+                        "text": entry.get("text", ""),
+                        "score": entry.get("score", 0.0),
+                    }
+                    for entry in relevant[:8]
+                ],
+            },
+        }
+    ]
 
 
 def _build_global_timeline_memory(instance, include_assistant_turns=True):
@@ -1050,9 +1789,13 @@ def iter_history_memories(instance, granularity="hybrid", include_assistant_turn
     session_ids = instance.get("haystack_session_ids", [])
     session_dates = instance.get("haystack_dates", [])
     sessions = instance.get("haystack_sessions", [])
+    plan = analyze_question(instance)
 
     if granularity not in {"turn", "session", "hybrid"}:
         raise ValueError("granularity must be 'turn', 'session', or 'hybrid'")
+
+    staged = []
+    fact_memories = []
 
     if granularity == "hybrid":
         global_timeline = _build_global_timeline_memory(
@@ -1065,7 +1808,7 @@ def iter_history_memories(instance, granularity="hybrid", include_assistant_turn
                     "question_id": instance.get("question_id"),
                 }
             )
-            yield global_timeline
+            staged.append(global_timeline)
 
     for session_id, session_date, session in zip(session_ids, session_dates, sessions):
         if granularity in {"session", "hybrid"}:
@@ -1076,7 +1819,7 @@ def iter_history_memories(instance, granularity="hybrid", include_assistant_turn
                 include_assistant_turns=include_assistant_turns,
             )
             episode["metadata"].update({"question_id": instance.get("question_id")})
-            yield episode
+            staged.append(episode)
         if granularity == "hybrid":
             timeline = _build_timeline_memory(
                 session_id,
@@ -1085,7 +1828,7 @@ def iter_history_memories(instance, granularity="hybrid", include_assistant_turn
                 include_assistant_turns=include_assistant_turns,
             )
             timeline["metadata"].update({"question_id": instance.get("question_id")})
-            yield timeline
+            staged.append(timeline)
         if granularity in {"turn", "hybrid"}:
             for fact_memory in _build_fact_memories(
                 session_id,
@@ -1094,7 +1837,16 @@ def iter_history_memories(instance, granularity="hybrid", include_assistant_turn
                 include_assistant_turns=include_assistant_turns,
             ):
                 fact_memory["metadata"].update({"question_id": instance.get("question_id")})
-                yield fact_memory
+                fact_memories.append(fact_memory)
+
+    if granularity == "hybrid":
+        for aggregate_memory in _build_multi_session_aggregate_memories(instance, plan, fact_memories):
+            staged.append(aggregate_memory)
+
+    for memory_item in staged:
+        yield memory_item
+    for fact_memory in fact_memories:
+        yield fact_memory
 
 
 def build_query_text(instance, include_question_date=True):
@@ -1114,25 +1866,42 @@ def analyze_question(instance, include_question_date=True):
     question_date = (instance.get("question_date") or "").strip()
     normalized_question_date = normalize_date(question_date)
     targets = _extract_question_targets(question)
+    question_type = instance.get("question_type", "")
+    is_multi_session = "multi-session" in question_type
 
     reasoning_kind = "factual"
     unit_hint = ""
     ordering_direction = "first"
-    if "how many days" in lowered:
-        reasoning_kind = "difference"
-        unit_hint = "days"
-    elif "how many weeks" in lowered:
-        reasoning_kind = "difference"
-        unit_hint = "weeks"
-    elif "how many months" in lowered:
-        reasoning_kind = "difference"
-        unit_hint = "months"
-    elif "what was the date" in lowered or "which date" in lowered:
-        reasoning_kind = "date"
-        ordering_direction = "last" if " last" in lowered else "first"
-    elif any(token in lowered for token in ("first", "last", "before", "after")):
-        reasoning_kind = "ordering"
-        ordering_direction = "last" if " last" in lowered else "first"
+    multi_session = {
+        "kind": "",
+        "subject": "",
+        "actions": [],
+        "focus_terms": [],
+        "range_start": "",
+        "range_end": "",
+        "requires_distinct": False,
+        "requires_current_state": False,
+    }
+    if is_multi_session:
+        reasoning_kind = "multi-session"
+        unit_hint = _infer_quantity_unit(question)
+        multi_session = _analyze_multi_session(question, normalized_question_date)
+    else:
+        if "how many days" in lowered:
+            reasoning_kind = "difference"
+            unit_hint = "days"
+        elif "how many weeks" in lowered:
+            reasoning_kind = "difference"
+            unit_hint = "weeks"
+        elif "how many months" in lowered:
+            reasoning_kind = "difference"
+            unit_hint = "months"
+        elif "what was the date" in lowered or "which date" in lowered:
+            reasoning_kind = "date"
+            ordering_direction = "last" if " last" in lowered else "first"
+        elif any(token in lowered for token in ("first", "last", "before", "after")):
+            reasoning_kind = "ordering"
+            ordering_direction = "last" if " last" in lowered else "first"
 
     filter_month = ""
     month_match = _IN_MONTH_RE.search(question)
@@ -1141,13 +1910,14 @@ def analyze_question(instance, include_question_date=True):
 
     return QuestionPlan(
         question_id=instance.get("question_id", ""),
-        question_type=instance.get("question_type", ""),
+        question_type=question_type,
         question=question,
         query_text=build_query_text(instance, include_question_date=include_question_date),
         question_date=question_date,
         normalized_question_date=normalized_question_date,
         reasoning_kind=reasoning_kind,
-        is_temporal="temporal" in instance.get("question_type", "") or reasoning_kind in {"ordering", "difference", "date"},
+        is_temporal=(not is_multi_session)
+        and ("temporal" in question_type or reasoning_kind in {"ordering", "difference", "date"}),
         unit_hint=unit_hint,
         targets=targets,
         normalized_targets=[_normalize_target_text(target) for target in targets],
@@ -1155,11 +1925,20 @@ def analyze_question(instance, include_question_date=True):
         question_month=(normalized_question_date or "")[5:7] if normalized_question_date else "",
         ordering_direction=ordering_direction,
         filter_month=filter_month,
+        is_multi_session=is_multi_session,
+        multi_session_kind=multi_session["kind"],
+        multi_session_subject=multi_session["subject"],
+        multi_session_actions=multi_session["actions"],
+        multi_session_focus_terms=multi_session["focus_terms"],
+        range_start=multi_session["range_start"],
+        range_end=multi_session["range_end"],
+        requires_distinct=multi_session["requires_distinct"],
+        requires_current_state=multi_session["requires_current_state"],
     )
 
 
 def normalize_answer(text):
-    normalized = (text or "").lower().replace("\u2019", "'")
+    normalized = _coerce_text(text).lower().replace("\u2019", "'")
     normalized = _ORDINAL_SUFFIX_RE.sub(r"\1", normalized)
     normalized = normalized.translate(_PUNCT_TABLE)
     normalized = _ARTICLES_RE.sub(" ", normalized)
@@ -1260,6 +2039,17 @@ def question_policy(plan):
                 "similarity_threshold": 0.08,
             }
         )
+    elif plan.is_multi_session:
+        policy.update(
+            {
+                "top_k": 56,
+                "max_items": 7,
+                "token_budget": 960,
+                "critic_threshold": 0.36,
+                "maybe_threshold": 0.28,
+                "similarity_threshold": 0.05,
+            }
+        )
     return policy
 
 
@@ -1340,6 +2130,8 @@ def _granularity(hit):
 
 def _granularity_priority(hit):
     granularity = _granularity(hit)
+    if granularity == "aggregate":
+        return 5
     if granularity == "fact":
         return 4
     if granularity == "timeline":
@@ -1352,6 +2144,60 @@ def _granularity_priority(hit):
 
 
 def _candidate_selection_score(plan, hit):
+    if plan.is_multi_session:
+        metadata = hit.record.metadata
+        blob = normalize_answer(
+            " ".join(
+                value
+                for value in (
+                    hit.record.text,
+                    metadata.get("summary", ""),
+                    metadata.get("fact_text", ""),
+                    " ".join(metadata.get("aggregate_labels", [])),
+                    " ".join(metadata.get("event_aliases", [])),
+                    " ".join(metadata.get("entities", [])),
+                    " ".join(metadata.get("doctor_names", [])),
+                )
+                if value
+            )
+        )
+        focus_matches = sum(1 for token in plan.multi_session_focus_terms if token and token in blob)
+        action_matches = 0
+        for action in plan.multi_session_actions:
+            normalized_action = normalize_answer(action)
+            if normalized_action and normalized_action in blob:
+                action_matches += 1
+        score = (
+            (2.0 * hit.score)
+            + (1.6 * hit.critic_confidence)
+            + (0.35 * hit.record.importance)
+            + (0.3 * _granularity_priority(hit))
+            + (0.22 * focus_matches)
+            + (0.18 * action_matches)
+        )
+        if hit.record.memory_type == "aggregate":
+            score += 1.8
+            score += 0.9 * float(metadata.get("aggregate_confidence", 0.0) or 0.0)
+            if metadata.get("aggregate_answer"):
+                score += 0.4
+        if metadata.get("currency_values"):
+            score += 0.6 if plan.multi_session_kind == "sum_money" else 0.1
+        if metadata.get("quantity_values"):
+            score += 0.6 if plan.multi_session_kind == "sum_quantity" else 0.1
+        if metadata.get("clock_times"):
+            score += 0.6 if plan.multi_session_kind == "time_lookup" else 0.1
+        if metadata.get("doctor_names"):
+            score += 0.4 if plan.requires_distinct else 0.1
+        if plan.requires_current_state and any(token in blob for token in ("current", "currently", "still", "use", "own", "have", "leading")):
+            score += 0.3
+        if plan.range_start or plan.range_end:
+            entry_date = metadata.get("event_date") or normalize_date(metadata.get("session_date", ""))
+            if entry_date:
+                if _entry_in_range({"event_date": entry_date}, plan):
+                    score += 0.2
+                else:
+                    score -= 0.25
+        return score
     score = temporal_bundle_score(plan, hit)
     score += 0.35 * _granularity_priority(hit)
     score += 0.45 * len(_target_matches(plan, hit))
@@ -1393,6 +2239,18 @@ def temporal_bundle_score(plan, hit):
 
 def render_evidence_line(hit, index=None):
     metadata = hit.record.metadata
+    if metadata.get("granularity") == "aggregate" or hit.record.memory_type == "aggregate":
+        aggregate_kind = metadata.get("aggregate_kind", "aggregate")
+        answer = metadata.get("aggregate_answer") or "unknown"
+        confidence = float(metadata.get("aggregate_confidence", 0.0) or 0.0)
+        prefix = f"{index}. " if index is not None else ""
+        return (
+            f"{prefix}kind=aggregate ; "
+            f"aggregate_kind={aggregate_kind} ; "
+            f"answer={preview(answer, limit=72)} ; "
+            f"confidence={confidence:.2f} ; "
+            f"evidence={preview(metadata.get('summary') or hit.record.text, limit=180)}"
+        )
     date_value = metadata.get("event_date") or normalize_date(metadata.get("session_date", ""))
     anchor_date = normalize_date(metadata.get("session_date", ""))
     granularity = metadata.get("granularity") or hit.record.memory_type
@@ -1522,6 +2380,77 @@ def select_bundled_hits(plan, hits, max_items, max_tokens, encode=None):
                     add_hit(hit)
                 if current_answerability()["sufficient"] and len(selected) >= max(2, min(4, len(plan.normalized_targets) + 1)):
                     break
+    elif plan.is_multi_session:
+        aggregate_hits = [
+            hit for hit in ranked
+            if hit.record.memory_type == "aggregate" or hit.record.metadata.get("granularity") == "aggregate"
+        ]
+        aggregate_hits.sort(
+            key=lambda hit: (
+                float(hit.record.metadata.get("aggregate_confidence", 0.0) or 0.0),
+                _candidate_selection_score(plan, hit),
+            ),
+            reverse=True,
+        )
+        best_aggregate = next(iter(aggregate_hits), None)
+        if best_aggregate is not None:
+            add_hit(best_aggregate)
+
+        def multi_session_useful_increment(hit):
+            if hit.record.memory_type == "aggregate":
+                return False
+            metadata = hit.record.metadata
+            blob = normalize_answer(
+                " ".join(
+                    value
+                    for value in (
+                        hit.record.text,
+                        metadata.get("fact_text", ""),
+                        metadata.get("summary", ""),
+                        " ".join(metadata.get("aggregate_labels", [])),
+                        " ".join(metadata.get("event_aliases", [])),
+                        " ".join(metadata.get("entities", [])),
+                        " ".join(metadata.get("doctor_names", [])),
+                    )
+                    if value
+                )
+            )
+            if any(token in blob for token in plan.multi_session_focus_terms):
+                return True
+            if any(normalize_answer(action) in blob for action in plan.multi_session_actions if action):
+                return True
+            if plan.multi_session_kind == "sum_money" and metadata.get("currency_values"):
+                return True
+            if plan.multi_session_kind == "sum_quantity" and metadata.get("quantity_values"):
+                return True
+            if plan.multi_session_kind == "time_lookup" and metadata.get("clock_times"):
+                return True
+            if plan.requires_distinct and (metadata.get("doctor_names") or metadata.get("entities")):
+                return True
+            return False
+
+        for hit in ranked:
+            if len(selected) >= max_items:
+                break
+            if hit.record.memory_id in selected_ids:
+                continue
+            if not multi_session_useful_increment(hit):
+                continue
+            add_hit(hit)
+            if current_answerability()["sufficient"] and len(selected) >= min(max_items, 4):
+                break
+
+        if not current_answerability()["sufficient"]:
+            for hit in ranked:
+                if len(selected) >= max_items:
+                    break
+                if hit.record.memory_id in selected_ids:
+                    continue
+                if hit.record.memory_type == "aggregate":
+                    continue
+                add_hit(hit)
+                if current_answerability()["sufficient"] and len(selected) >= min(max_items, 5):
+                    break
     else:
         for hit in ranked:
             if not add_hit(hit):
@@ -1546,6 +2475,46 @@ def assess_answerability(plan, selected_hits):
 
     reasons = []
     sufficient = True
+    if plan.is_multi_session:
+        aggregate_hit = next(
+            (
+                hit
+                for hit in selected_hits
+                if hit.record.memory_type == "aggregate"
+                or hit.record.metadata.get("granularity") == "aggregate"
+            ),
+            None,
+        )
+        if aggregate_hit is not None:
+            aggregate_confidence = float(aggregate_hit.record.metadata.get("aggregate_confidence", 0.0) or 0.0)
+            aggregate_entries = aggregate_hit.record.metadata.get("aggregate_entries", [])
+            if aggregate_hit.record.metadata.get("aggregate_answer") and (
+                aggregate_confidence >= 0.58 or len(aggregate_entries) >= 2
+            ):
+                sufficient = True
+                reasons.append("aggregate-answer")
+            else:
+                sufficient = False
+                reasons.append("weak-aggregate-answer")
+        else:
+            sufficient = False
+            reasons.append("missing-aggregate")
+
+        if not aggregate_hit:
+            supporting_hits = [
+                hit for hit in selected_hits
+                if hit.record.memory_type != "aggregate"
+            ]
+            if len(supporting_hits) >= 2:
+                sufficient = True
+                reasons.append("supporting-facts")
+        return {
+            "sufficient": sufficient,
+            "reasons": reasons or ["enough-evidence"],
+            "distinct_dates": sorted(value for value in distinct_dates if value),
+            "distinct_sessions": sorted(distinct_sessions),
+            "covered_targets": sorted(covered_targets),
+        }
     if plan.reasoning_kind == "difference":
         if len(distinct_dates) < 2:
             sufficient = False
@@ -1671,6 +2640,35 @@ def _flatten_structured_events(plan, selected_hits):
     return deduped
 
 
+def _build_multi_session_entries_from_hits(plan, selected_hits):
+    entries = []
+    for index, hit in enumerate(selected_hits):
+        if hit.record.memory_type == "aggregate":
+            continue
+        metadata = hit.record.metadata
+        entries.append(
+            {
+                "entry_id": hit.record.memory_id or f"selected-{index}",
+                "session_id": metadata.get("session_id"),
+                "event_date": metadata.get("event_date") or normalize_date(metadata.get("session_date", "")),
+                "session_date": normalize_date(metadata.get("session_date", "")),
+                "text": metadata.get("fact_text") or metadata.get("summary") or hit.record.text,
+                "labels": metadata.get("aggregate_labels", []),
+                "event_aliases": metadata.get("event_aliases", []),
+                "entities": metadata.get("entities", []),
+                "currency_values": metadata.get("currency_values", []),
+                "quantity_values": metadata.get("quantity_values", []),
+                "clock_times": metadata.get("clock_times", []),
+                "doctor_names": metadata.get("doctor_names", []),
+                "memory_text": hit.record.text,
+                "importance": hit.record.importance,
+                "has_answer": metadata.get("has_answer", False),
+                "score": _candidate_selection_score(plan, hit),
+            }
+        )
+    return entries
+
+
 def _event_matches_target(event, target):
     if not target:
         return False
@@ -1727,6 +2725,26 @@ def _format_month_day(date_value):
 
 
 def build_structured_event_view(plan, selected_hits, limit=8):
+    if plan.is_multi_session:
+        events = []
+        for hit in selected_hits:
+            metadata = hit.record.metadata
+            if hit.record.memory_type == "aggregate":
+                for entry in metadata.get("aggregate_entries", [])[:limit]:
+                    events.append(
+                        {
+                            "event_date": entry.get("event_date", ""),
+                            "date_source": "aggregate-window",
+                            "date_confidence": float(metadata.get("aggregate_confidence", 0.0) or 0.0),
+                            "granularity": "aggregate",
+                            "label": entry.get("display_key", ""),
+                            "aliases": [],
+                            "session_id": entry.get("session_id"),
+                        }
+                    )
+            if len(events) >= limit:
+                break
+        return events[:limit]
     events = _flatten_structured_events(plan, selected_hits)
     if plan.filter_month:
         filtered = [
@@ -1739,6 +2757,45 @@ def build_structured_event_view(plan, selected_hits, limit=8):
 
 
 def solve_temporal_question(plan, selected_hits):
+    if plan.is_multi_session:
+        aggregate_candidates = [
+            hit
+            for hit in selected_hits
+            if hit.record.memory_type == "aggregate"
+            or hit.record.metadata.get("granularity") == "aggregate"
+        ]
+        aggregate_candidates.sort(
+            key=lambda hit: float(hit.record.metadata.get("aggregate_confidence", 0.0) or 0.0),
+            reverse=True,
+        )
+        if aggregate_candidates:
+            best = aggregate_candidates[0]
+            metadata = best.record.metadata
+            answer = _collapse(metadata.get("aggregate_answer", ""))
+            confidence = float(metadata.get("aggregate_confidence", 0.0) or 0.0)
+            if answer:
+                return TemporalSolution(
+                    resolved=True,
+                    answer=answer,
+                    confidence=confidence,
+                    rationale=metadata.get("aggregate_kind", "aggregate"),
+                    mode=metadata.get("aggregate_mode", "multi-session-aggregate"),
+                    supporting_memory_ids=[
+                        entry.get("entry_id", "")
+                        for entry in metadata.get("aggregate_entries", [])[:8]
+                    ],
+                    supporting_dates=[
+                        entry.get("event_date", "")
+                        for entry in metadata.get("aggregate_entries", [])[:8]
+                    ],
+                )
+
+        entries = _build_multi_session_entries_from_hits(plan, selected_hits)
+        if entries:
+            entries.sort(key=lambda item: item.get("score", 0.0), reverse=True)
+            return _solve_multi_session_from_entries(plan, entries)
+        return TemporalSolution(False, "", 0.0, "no-multi-session-evidence", "insufficient", [], [])
+
     events = build_structured_event_view(plan, selected_hits, limit=24)
     if not events:
         return TemporalSolution(
@@ -1886,7 +2943,19 @@ def build_evidence_table(plan, selected_hits, structured_events=None):
 def build_benchmark_instructions(plan, selected_hits, answerability, base_system_prompt, structured_events=None, solver_result=None):
     parts = [base_system_prompt]
     parts.append("Use only the evidence table when it is present. Do not invent dates or events.")
-    if plan.reasoning_kind == "ordering":
+    if plan.is_multi_session:
+        if plan.multi_session_kind in {"count_entries", "count_distinct"}:
+            parts.append("For multi-session counting questions, return only the final number with no explanation.")
+        elif plan.multi_session_kind == "sum_money":
+            parts.append("For multi-session money questions, return only the final total amount like '$120', with no explanation.")
+        elif plan.multi_session_kind == "sum_quantity":
+            unit = plan.unit_hint or "units"
+            parts.append(f"For multi-session total questions, return only the final total like '12 {unit}', with no explanation.")
+        elif plan.multi_session_kind == "time_lookup":
+            parts.append("For multi-session time lookup questions, return only the final time with no explanation.")
+        else:
+            parts.append("For multi-session questions, return only the final answer with no explanation.")
+    elif plan.reasoning_kind == "ordering":
         parts.append("For ordering questions, return only the event/item that happened first or last, with no explanation.")
         if plan.targets:
             parts.append("Valid answer options: " + " | ".join(plan.targets))
@@ -1927,6 +2996,33 @@ def postprocess_prediction(plan, text):
             "there is no information",
         )
     )
+    if plan.is_multi_session:
+        if plan.multi_session_kind in {"count_entries", "count_distinct"}:
+            match = re.search(r"\b\d+\b", value)
+            if match:
+                return match.group(0)
+        if plan.multi_session_kind == "sum_money":
+            money_match = _MONEY_RE.search(value)
+            if money_match:
+                return _format_money(_parse_amount_token(money_match.group(0)))
+        if plan.multi_session_kind == "sum_quantity":
+            unit = _normalize_unit(plan.unit_hint or "")
+            for quantity_match in _QUANTITY_RE.finditer(value):
+                found_unit = _normalize_unit(quantity_match.group(2))
+                if not unit or found_unit == unit:
+                    return f"{_format_numeric_value(float(quantity_match.group(1)))} {quantity_match.group(2).lower()}"
+            number_match = re.search(r"\b\d+(?:\.\d+)?\b", value)
+            if number_match and plan.unit_hint:
+                return f"{_format_numeric_value(float(number_match.group(0)))} {plan.unit_hint}"
+        if plan.multi_session_kind == "time_lookup":
+            time_match = _TIME_OF_DAY_RE.search(value)
+            if time_match:
+                minute = time_match.group(2)
+                if minute and minute != "00":
+                    return f"{int(time_match.group(1))}:{minute} {time_match.group(3).lower()}"
+                return f"{int(time_match.group(1))} {time_match.group(3).lower()}"
+        if has_abstention_marker:
+            return "Insufficient evidence"
     if plan.reasoning_kind == "difference":
         unit = plan.unit_hint or "days"
         if unit == "months":
