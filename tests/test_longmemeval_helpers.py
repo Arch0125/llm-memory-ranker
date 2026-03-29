@@ -3,6 +3,13 @@ import unittest
 from benchmarks.longmemeval import (
     acceptable_answers,
     analyze_question,
+    build_history_context,
+    build_official_retrieval_corpus,
+    evaluate_official_retrieval,
+    evaluate_official_retrieval_turn2session,
+    is_single_session_question,
+    _candidate_selection_score,
+    _single_session_exact_target_matches,
     build_structured_event_view,
     build_query_text,
     contains_match_score,
@@ -10,9 +17,11 @@ from benchmarks.longmemeval import (
     iter_history_memories,
     normalize_answer,
     postprocess_prediction,
+    select_raw_session_hits,
     solve_temporal_question,
     select_bundled_hits,
     selected_session_recall,
+    single_session_include_assistant_turns,
     summarize_records,
     token_f1_score,
     assess_answerability,
@@ -214,6 +223,222 @@ class LongMemEvalHelpersTest(unittest.TestCase):
         }
         memories = list(iter_history_memories(instance, granularity="turn", include_assistant_turns=False))
         self.assertEqual(memories[0]["metadata"]["event_date"], "2023-04-24")
+
+    def test_build_history_context_full_history_excludes_assistant_when_requested(self):
+        instance = {
+            "question_id": "q-history",
+            "question_type": "single-session-user",
+            "question": "What did I buy?",
+            "answer": "coffee maker",
+            "question_date": "2024/01/10 (Wed) 10:00",
+            "haystack_session_ids": ["s1"],
+            "haystack_dates": ["2024/01/01 (Mon) 09:00"],
+            "haystack_sessions": [[
+                {"role": "user", "content": "I bought a coffee maker.", "has_answer": True},
+                {"role": "assistant", "content": "Nice purchase."},
+            ]],
+            "answer_session_ids": ["s1"],
+        }
+        context = build_history_context(
+            instance,
+            include_assistant_turns=False,
+            answer_sessions_only=False,
+            history_format="nl",
+        )
+        self.assertIn("Session s1", context)
+        self.assertIn("User: I bought a coffee maker.", context)
+        self.assertNotIn("Assistant:", context)
+
+    def test_build_history_context_oracle_only_keeps_answer_sessions(self):
+        instance = {
+            "question_id": "q-oracle",
+            "question_type": "single-session-user",
+            "question": "What did I buy?",
+            "answer": "coffee maker",
+            "question_date": "2024/01/10 (Wed) 10:00",
+            "haystack_session_ids": ["s1", "s2"],
+            "haystack_dates": ["2024/01/01 (Mon) 09:00", "2024/01/02 (Tue) 09:00"],
+            "haystack_sessions": [
+                [{"role": "user", "content": "I bought a coffee maker.", "has_answer": True}],
+                [{"role": "user", "content": "I watched a movie."}],
+            ],
+            "answer_session_ids": ["s1"],
+        }
+        context = build_history_context(
+            instance,
+            include_assistant_turns=True,
+            answer_sessions_only=True,
+            history_format="nl",
+        )
+        self.assertIn("Session s1", context)
+        self.assertNotIn("Session s2", context)
+
+    def test_official_retrieval_corpus_turn_uses_answer_and_noans_ids(self):
+        instance = {
+            "question_id": "q-ret",
+            "question_type": "temporal-reasoning",
+            "question": "What did I buy?",
+            "answer": "coffee maker",
+            "question_date": "2024/01/10 (Wed) 10:00",
+            "haystack_session_ids": ["answer_s1"],
+            "haystack_dates": ["2024/01/01 (Mon) 09:00"],
+            "haystack_sessions": [[
+                {"role": "user", "content": "I watched a movie.", "has_answer": False},
+                {"role": "user", "content": "I bought a coffee maker.", "has_answer": True},
+            ]],
+            "answer_session_ids": ["answer_s1"],
+        }
+        _, corpus_ids, _, _ = build_official_retrieval_corpus(instance, granularity="turn")
+        self.assertEqual(corpus_ids, ["noans_s1_1", "answer_s1_2"])
+
+    def test_official_retrieval_turn2session_metrics_match_expected(self):
+        corpus_ids = ["noans_s1_1", "answer_s1_2", "answer_s2_1", "s3_1"]
+        correct_docs = ["answer_s1_2", "answer_s2_1"]
+        rankings = [1, 2, 0, 3]
+        _, recall_all, ndcg_any = evaluate_official_retrieval_turn2session(rankings, correct_docs, corpus_ids, k=2)
+        self.assertEqual(recall_all, 1.0)
+        self.assertGreater(ndcg_any, 0.9)
+
+    def test_official_retrieval_session_metrics_match_expected(self):
+        corpus_ids = ["s1", "answer_s2", "answer_s3"]
+        correct_docs = ["answer_s2", "answer_s3"]
+        rankings = [1, 2, 0]
+        _, recall_all, ndcg_any = evaluate_official_retrieval(rankings, correct_docs, corpus_ids, k=2)
+        self.assertEqual(recall_all, 1.0)
+        self.assertEqual(ndcg_any, 1.0)
+
+    def test_single_session_helpers_route_assistant_questions(self):
+        plan = analyze_question(
+            {
+                "question_id": "q-ssa",
+                "question_type": "single-session-assistant",
+                "question": "What restaurant did you recommend?",
+                "answer": "Cafe Roma",
+                "question_date": "2024/01/10 (Wed) 10:00",
+            }
+        )
+        self.assertTrue(is_single_session_question(plan))
+        self.assertTrue(single_session_include_assistant_turns(plan, default=False))
+
+    def test_select_raw_session_hits_prefers_best_session(self):
+        plan = analyze_question(
+            {
+                "question_id": "q-ssu",
+                "question_type": "single-session-user",
+                "question": "What device did I buy?",
+                "answer": "Samsung Galaxy S22",
+                "question_date": "2024/01/10 (Wed) 10:00",
+            }
+        )
+        hit1 = make_hit(
+            "s1",
+            text="2024-01-02 | User: I bought the Samsung Galaxy S22.",
+            entities=["Samsung Galaxy S22"],
+            score=0.95,
+            confidence=0.9,
+        )
+        hit1.record.metadata["granularity"] = "episode"
+        hit2 = make_hit(
+            "s2",
+            text="2024-01-03 | User: I cleaned my bike.",
+            entities=["bike"],
+            score=0.3,
+            confidence=0.2,
+        )
+        hit2.record.metadata["granularity"] = "episode"
+        selected_hits, session_ids = select_raw_session_hits(plan, [hit2, hit1], max_sessions=1)
+        self.assertEqual(session_ids, ["s1"])
+        self.assertEqual(len(selected_hits), 1)
+        self.assertEqual(selected_hits[0].record.metadata["session_id"], "s1")
+
+    def test_single_session_exact_target_match_prefers_episode_hit(self):
+        plan = analyze_question(
+            {
+                "question_id": "q-ssu2",
+                "question_type": "single-session-user",
+                "question": "Which device did I get first, the Samsung Galaxy S22 or the Dell XPS 13?",
+                "answer": "Samsung Galaxy S22",
+                "question_date": "2024/01/10 (Wed) 10:00",
+            }
+        )
+        exact_hit = make_hit(
+            "s1",
+            text="2024-01-02 | User: I got the Samsung Galaxy S22 from Best Buy.",
+            entities=["Samsung Galaxy S22"],
+            score=0.55,
+            confidence=0.55,
+        )
+        exact_hit.record.metadata["granularity"] = "episode"
+        distractor_hit = make_hit(
+            "s2",
+            text="2024-01-03 | User: I cleaned my bike and visited a cafe.",
+            entities=["bike"],
+            score=0.9,
+            confidence=0.8,
+        )
+        distractor_hit.record.metadata["granularity"] = "episode"
+        self.assertIn("Samsung Galaxy S22", _single_session_exact_target_matches(plan, exact_hit))
+        self.assertGreater(_candidate_selection_score(plan, exact_hit), _candidate_selection_score(plan, distractor_hit))
+
+    def test_select_raw_session_hits_single_session_uses_fact_signal_to_pick_session(self):
+        plan = analyze_question(
+            {
+                "question_id": "q-ssu-fact",
+                "question_type": "single-session-user",
+                "question": "What speed is my new internet plan?",
+                "answer": "500 Mbps",
+                "question_date": "2024/01/10 (Wed) 10:00",
+            }
+        )
+        relevant_fact = make_hit(
+            "s1",
+            text="2024-01-02 | User: I upgraded my internet plan to 500 Mbps today.",
+            entities=["500 Mbps", "internet plan"],
+            granularity="fact",
+            score=0.88,
+            confidence=0.7,
+        )
+        distractor_episode = make_hit(
+            "s2",
+            text="2024-01-03 | User: I was comparing internet providers and router models.",
+            entities=["internet providers", "router models"],
+            granularity="episode",
+            score=0.74,
+            confidence=0.8,
+        )
+        selected_hits, session_ids = select_raw_session_hits(plan, [distractor_episode, relevant_fact], max_sessions=2)
+        self.assertEqual(session_ids[0], "s1")
+        self.assertEqual(selected_hits[0].record.metadata["session_id"], "s1")
+
+    def test_select_raw_session_hits_single_session_returns_two_sessions_when_confidence_is_close(self):
+        plan = analyze_question(
+            {
+                "question_id": "q-ssu-close",
+                "question_type": "single-session-user",
+                "question": "Where did I buy my new bookshelf from?",
+                "answer": "IKEA",
+                "question_date": "2024/01/10 (Wed) 10:00",
+            }
+        )
+        close_hit_a = make_hit(
+            "s1",
+            text="2024-01-02 | User: I bought a new bookshelf from IKEA.",
+            entities=["IKEA", "bookshelf"],
+            granularity="fact",
+            score=0.7,
+            confidence=0.62,
+        )
+        close_hit_b = make_hit(
+            "s2",
+            text="2024-01-03 | User: I was browsing furniture stores for a bookshelf.",
+            entities=["bookshelf", "furniture stores"],
+            granularity="episode",
+            score=0.69,
+            confidence=0.6,
+        )
+        _, session_ids = select_raw_session_hits(plan, [close_hit_b, close_hit_a], max_sessions=2)
+        self.assertEqual(len(session_ids), 2)
+        self.assertEqual(session_ids[0], "s1")
 
     def test_iter_history_memories_turn_granularity_keeps_target_terms_in_fact_text(self):
         instance = {
@@ -675,6 +900,38 @@ class LongMemEvalHelpersTest(unittest.TestCase):
         answerability = assess_answerability(plan, selected)
         self.assertEqual(selected[0].record.memory_type, "aggregate")
         self.assertTrue(answerability["sufficient"])
+
+    def test_select_raw_session_hits_multi_session_prefers_sessions_over_aggregate(self):
+        instance = {
+            "question_id": "q-ms-raw",
+            "question_type": "multi-session",
+            "question": "Which grocery store did I spend the most money at in the past month?",
+            "answer": "Thrive Market",
+            "question_date": "2024/05/30 (Thu) 09:00",
+            "haystack_session_ids": [],
+            "haystack_dates": [],
+            "haystack_sessions": [],
+            "answer_session_ids": [],
+        }
+        plan = analyze_question(instance)
+        aggregate = make_aggregate_hit(
+            text="Aggregate memory for grocery spending.",
+            aggregate_kind="max_value",
+            aggregate_answer="Thrive Market",
+            aggregate_confidence=0.91,
+            entries=[
+                {"entry_id": "e1", "session_id": "s1", "event_date": "2024-05-18"},
+                {"entry_id": "e2", "session_id": "s2", "event_date": "2024-05-21"},
+            ],
+        )
+        facts = [
+            make_hit("s1", text="2024-05-16 | I went grocery shopping at Walmart and spent $120.", entities=["Walmart"], granularity="fact"),
+            make_hit("s2", text="2024-05-18 | I bought groceries on Thrive Market for $150.", entities=["Thrive Market"], granularity="fact"),
+            make_hit("s3", text="2024-05-21 | I shopped at Trader Joe's and spent $80.", entities=["Trader Joe's"], granularity="fact"),
+        ]
+        selected_hits, session_ids = select_raw_session_hits(plan, [aggregate, *facts], max_sessions=3)
+        self.assertEqual(set(session_ids[:3]), {"s1", "s2", "s3"})
+        self.assertTrue(all(hit.record.memory_type != "aggregate" for hit in selected_hits))
 
     def test_solve_temporal_question_multi_session_uses_aggregate_answer(self):
         instance = {

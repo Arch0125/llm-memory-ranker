@@ -1,10 +1,11 @@
 import json
+import math
 import os
 import sqlite3
 import uuid
 
 from .types import MemoryHit, MemoryRecord
-from .utils import cosine_similarity, iso_timestamp, parse_timestamp, utc_now
+from .utils import cosine_similarity, iso_timestamp, parse_timestamp, tokenize, utc_now
 
 
 class SQLiteMemoryStore:
@@ -234,6 +235,104 @@ class SQLiteMemoryStore:
                     record=record,
                     score=score,
                     embedding_model=row["model_name"],
+                    age_days=age_days,
+                )
+            )
+
+        hits.sort(key=lambda hit: hit.score, reverse=True)
+        return hits[:top_k]
+
+    def keyword_search(
+        self,
+        query_text,
+        user_id,
+        top_k=20,
+        type_allowlist=None,
+        status="active",
+    ):
+        """Search memories by keyword overlap (BM25-like scoring).
+
+        Returns MemoryHit objects scored by token overlap with the query.
+        This complements embedding search by catching memories that share
+        specific keywords even when embedding similarity is low.
+        """
+        query_tokens = set(tokenize(query_text, drop_stopwords=True))
+        if not query_tokens:
+            return []
+
+        clauses = ["m.user_id = ?", "m.status = ?"]
+        params = [user_id, status]
+        if type_allowlist:
+            placeholders = ", ".join("?" for _ in type_allowlist)
+            clauses.append(f"m.type IN ({placeholders})")
+            params.extend(type_allowlist)
+        rows = self.conn.execute(
+            f"""
+            SELECT m.*
+            FROM memory_item m
+            WHERE {' AND '.join(clauses)}
+            """,
+            params,
+        ).fetchall()
+
+        # Compute IDF weights: tokens appearing in fewer documents are more valuable
+        doc_count = len(rows)
+        if doc_count == 0:
+            return []
+        token_doc_freq = {}
+        row_tokens_cache = {}
+        for i, row in enumerate(rows):
+            text = row["text"]
+            metadata = json.loads(row["metadata_json"] or "{}")
+            # Include metadata fields in the searchable text
+            searchable = " ".join(
+                v for v in (
+                    text,
+                    metadata.get("fact_text", ""),
+                    metadata.get("summary", ""),
+                    " ".join(metadata.get("entities", [])),
+                    " ".join(metadata.get("event_aliases", [])),
+                    " ".join(metadata.get("aggregate_labels", [])),
+                )
+                if v
+            )
+            doc_tokens = set(tokenize(searchable, drop_stopwords=True))
+            row_tokens_cache[i] = doc_tokens
+            for token in doc_tokens:
+                token_doc_freq[token] = token_doc_freq.get(token, 0) + 1
+
+        hits = []
+        now = utc_now()
+        for i, row in enumerate(rows):
+            doc_tokens = row_tokens_cache[i]
+            shared = query_tokens & doc_tokens
+            if not shared:
+                continue
+
+            # BM25-like score: sum of IDF-weighted matches
+            score = 0.0
+            for token in shared:
+                df = token_doc_freq.get(token, 1)
+                idf = math.log((doc_count + 1) / (df + 1)) + 1.0
+                # Boost long tokens (more distinctive)
+                length_bonus = min(len(token) / 8.0, 1.5)
+                score += idf * length_bonus
+
+            # Normalize by query size
+            max_possible = sum(
+                (math.log((doc_count + 1) / (token_doc_freq.get(t, 1) + 1)) + 1.0) * min(len(t) / 8.0, 1.5)
+                for t in query_tokens
+            )
+            if max_possible > 0:
+                score = score / max_possible
+
+            record = self._record_from_row(row)
+            age_days = max(0, (now - parse_timestamp(record.last_accessed_at)).days)
+            hits.append(
+                MemoryHit(
+                    record=record,
+                    score=score,
+                    embedding_model="keyword",
                     age_days=age_days,
                 )
             )

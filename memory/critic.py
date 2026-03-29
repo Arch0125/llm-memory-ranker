@@ -214,6 +214,10 @@ class HeuristicCritic:
             return CriticDecision(label="use", confidence=confidence, reasons=reasons)
         if confidence >= self.maybe_threshold and (has_shared or entity_overlap > 0.0 or temporal_request):
             return CriticDecision(label="maybe", confidence=confidence, reasons=reasons)
+        # Be more permissive: if there's any token overlap and non-trivial confidence,
+        # label as "maybe" instead of "ignore" to avoid losing potentially relevant memories
+        if has_shared and confidence >= self.maybe_threshold * 0.7:
+            return CriticDecision(label="maybe", confidence=confidence, reasons=reasons + ["lenient-shared"])
         return CriticDecision(label="ignore", confidence=confidence, reasons=reasons or ["low-applicability"])
 
 

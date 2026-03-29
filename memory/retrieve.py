@@ -55,6 +55,57 @@ def retrieve_candidates(query_text, store, embedder, user_id, top_k=20, type_all
     )
 
 
+def retrieve_hybrid_candidates(
+    query_text,
+    store,
+    embedder,
+    user_id,
+    top_k=20,
+    type_allowlist=None,
+    keyword_weight=0.35,
+):
+    """Retrieve candidates using both embedding similarity and keyword overlap.
+
+    Merges results from embedding search and keyword search, combining scores
+    for memories found by both methods.  This catches memories with matching
+    keywords that hash embeddings might rank low.
+    """
+    embedding_hits = retrieve_candidates(
+        query_text, store, embedder, user_id, top_k=top_k, type_allowlist=type_allowlist,
+    )
+    keyword_hits = store.keyword_search(
+        query_text, user_id, top_k=top_k, type_allowlist=type_allowlist,
+    )
+
+    # Merge: index by memory_id, combine scores
+    merged = {}
+    for hit in embedding_hits:
+        merged[hit.record.memory_id] = hit
+
+    embedding_weight = 1.0 - keyword_weight
+    for kw_hit in keyword_hits:
+        mid = kw_hit.record.memory_id
+        if mid in merged:
+            # Blend: keep the embedding hit but boost its score with keyword score
+            existing = merged[mid]
+            existing.score = (
+                embedding_weight * existing.score
+                + keyword_weight * kw_hit.score
+            )
+            if not existing.reasons:
+                existing.reasons = []
+            existing.reasons.append(f"kw-boost={kw_hit.score:.2f}")
+        else:
+            # New hit from keyword search only - scale its score
+            kw_hit.score = keyword_weight * kw_hit.score
+            kw_hit.reasons = [f"keyword-only={kw_hit.score:.2f}"]
+            merged[mid] = kw_hit
+
+    all_hits = list(merged.values())
+    all_hits.sort(key=lambda h: h.score, reverse=True)
+    return all_hits[:top_k]
+
+
 def gate_hits(
     hits,
     sim_threshold,

@@ -7,13 +7,17 @@ from calendar import monthrange
 from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+import numpy as np
 
 from memory.utils import (
     STOPWORDS,
+    cosine_similarity,
     extract_entities,
     normalize_date,
     preview,
 )
+from memory.types import MemoryHit, MemoryRecord
+from memory.critic import HeuristicCritic, rerank_with_critic
 from prompt.budget import estimate_token_count
 
 
@@ -481,18 +485,293 @@ def acceptable_answers(answer):
     return variants
 
 
-def format_session_text(session_id, session_date, session):
+def format_session_text(session_id, session_date, session, include_assistant_turns=True):
     header = f"Session {session_id}"
     if session_date:
         header += f" on {session_date}"
     lines = [header]
     for turn in session:
+        if (turn.get("role") or "").strip().lower() == "assistant" and not include_assistant_turns:
+            continue
         content = _collapse(turn.get("content") or "")
         if not content:
             continue
         role = (turn.get("role") or "user").strip().capitalize()
         lines.append(f"{role}: {content}")
     return "\n".join(lines)
+
+
+def build_history_context(
+    instance,
+    include_assistant_turns=True,
+    answer_sessions_only=False,
+    history_format="nl",
+    allowed_session_ids=None,
+):
+    session_ids = instance.get("haystack_session_ids", [])
+    session_dates = instance.get("haystack_dates", [])
+    sessions = instance.get("haystack_sessions", [])
+    if allowed_session_ids is not None:
+        allowed_session_ids = set(allowed_session_ids)
+    elif answer_sessions_only:
+        allowed_session_ids = set(instance.get("answer_session_ids", []))
+    rendered_sessions = []
+
+    for session_id, session_date, session in zip(session_ids, session_dates, sessions):
+        if allowed_session_ids is not None and session_id not in allowed_session_ids:
+            continue
+        if history_format == "json":
+            turns = []
+            for turn in session:
+                role = (turn.get("role") or "user").strip().lower()
+                if role == "assistant" and not include_assistant_turns:
+                    continue
+                content = _collapse(turn.get("content") or "")
+                if not content:
+                    continue
+                turns.append({"role": role, "content": content})
+            rendered_sessions.append(
+                {
+                    "session_id": session_id,
+                    "session_date": session_date,
+                    "turns": turns,
+                }
+            )
+        else:
+            rendered = format_session_text(
+                session_id,
+                session_date,
+                session,
+                include_assistant_turns=include_assistant_turns,
+            )
+            if rendered.strip():
+                rendered_sessions.append(rendered)
+
+    if history_format == "json":
+        return json.dumps(rendered_sessions, ensure_ascii=True, indent=2)
+    return "\n\n".join(rendered_sessions)
+
+
+def official_process_item_flat_index(data, granularity, sess_id, timestamp):
+    corpus = []
+    if granularity == "session":
+        text = " ".join(interact["content"] for interact in data if interact["role"] == "user")
+        corpus.append(text)
+        ids = [sess_id]
+        user_turns = [turn for turn in data if turn["role"] == "user"]
+        if "answer" in sess_id and user_turns and all(not turn.get("has_answer", False) for turn in user_turns):
+            ids = [sess_id.replace("answer", "noans")]
+    elif granularity == "turn":
+        ids = []
+        for i_turn, turn in enumerate(data):
+            if turn["role"] == "user":
+                corpus.append(turn["content"])
+                turn_id = f"{sess_id}_{i_turn + 1}"
+                if "answer" not in sess_id:
+                    ids.append(turn_id)
+                else:
+                    if turn.get("has_answer", False):
+                        ids.append(turn_id)
+                    else:
+                        ids.append(turn_id.replace("answer", "noans"))
+    else:
+        raise NotImplementedError
+    return corpus, ids, [timestamp for _ in corpus]
+
+
+def build_official_retrieval_corpus(instance, granularity):
+    corpus = []
+    corpus_ids = []
+    corpus_timestamps = []
+    session_lookup = {}
+    for sess_id, sess_entry, ts in zip(
+        instance.get("haystack_session_ids", []),
+        instance.get("haystack_sessions", []),
+        instance.get("haystack_dates", []),
+    ):
+        cur_items, cur_ids, cur_ts = official_process_item_flat_index(sess_entry, granularity, sess_id, ts)
+        corpus.extend(cur_items)
+        corpus_ids.extend(cur_ids)
+        corpus_timestamps.extend(cur_ts)
+        for corpus_id, text, timestamp in zip(cur_ids, cur_items, cur_ts):
+            session_lookup[corpus_id] = {
+                "session_id": sess_id,
+                "timestamp": timestamp,
+                "text": text,
+            }
+    return corpus, corpus_ids, corpus_timestamps, session_lookup
+
+
+def retrieval_dcg(relevances, k):
+    relevances = np.asarray(relevances, dtype=float)[:k]
+    if relevances.size:
+        return relevances[0] + np.sum(relevances[1:] / np.log2(np.arange(2, relevances.size + 1)))
+    return 0.0
+
+
+def retrieval_ndcg(rankings, correct_docs, corpus_ids, k=10):
+    relevances = [1 if doc_id in correct_docs else 0 for doc_id in corpus_ids]
+    sorted_relevances = [relevances[idx] for idx in rankings[:k]]
+    ideal_relevance = sorted(relevances, reverse=True)
+    ideal_dcg = retrieval_dcg(ideal_relevance, k)
+    actual_dcg = retrieval_dcg(sorted_relevances, k)
+    if ideal_dcg == 0:
+        return 0.0
+    return actual_dcg / ideal_dcg
+
+
+def evaluate_official_retrieval(rankings, correct_docs, corpus_ids, k=10):
+    recalled_docs = set(corpus_ids[idx] for idx in rankings[:k])
+    recall_any = float(any(doc in recalled_docs for doc in correct_docs))
+    recall_all = float(all(doc in recalled_docs for doc in correct_docs))
+    ndcg_score = retrieval_ndcg(rankings, correct_docs, corpus_ids, k)
+    return recall_any, recall_all, ndcg_score
+
+
+def evaluate_official_retrieval_turn2session(rankings, correct_docs, corpus_ids, k=10):
+    def strip_turn_id(docid):
+        return "_".join(docid.split("_")[:-1])
+
+    correct_docs = list(set(strip_turn_id(x) for x in correct_docs))
+    corpus_ids = [strip_turn_id(x) for x in corpus_ids]
+    effective_k = k
+    unique_docids = set(corpus_ids[idx] for idx in rankings[:effective_k])
+    while effective_k <= len(corpus_ids) and len(unique_docids) < k:
+        effective_k += 1
+        unique_docids = set(corpus_ids[idx] for idx in rankings[:effective_k])
+    return evaluate_official_retrieval(rankings, correct_docs, corpus_ids, k=effective_k)
+
+
+def _retrieval_age_days(question_date, item_timestamp):
+    left = _parse_iso_date(normalize_date(question_date))
+    right = _parse_iso_date(normalize_date(item_timestamp))
+    if left is None or right is None:
+        return 0
+    return max(0, (left - right).days)
+
+
+def build_official_retrieval_log_entry(instance, granularity, embedder, critic=None):
+    critic = critic or HeuristicCritic()
+    corpus, corpus_ids, corpus_timestamps, session_lookup = build_official_retrieval_corpus(instance, granularity)
+    query = instance.get("question", "")
+    query_vector = embedder.embed(query)
+    hits = []
+    for idx, (text, corpus_id, timestamp) in enumerate(zip(corpus, corpus_ids, corpus_timestamps)):
+        session_id = session_lookup[corpus_id]["session_id"]
+        event_meta = _build_event_items(text, timestamp, session_id=session_id, role="user")
+        metadata = {
+            "session_id": session_id,
+            "corpus_id": corpus_id,
+            "session_date": normalize_date(timestamp),
+            "event_date": event_meta.get("event_date") or normalize_date(timestamp),
+            "entities": extract_entities(text),
+            "event_aliases": event_meta.get("event_aliases", []),
+            "event_items": event_meta.get("event_items", []),
+            "date_confidence": event_meta.get("date_confidence", 0.0),
+            "date_source": event_meta.get("date_source", ""),
+            "granularity": granularity,
+            "rank_index": idx,
+            "fact_text": text,
+        }
+        hits.append(
+            MemoryHit(
+                record=MemoryRecord(
+                    memory_id=corpus_id,
+                    user_id="benchmark",
+                    memory_type="episode" if granularity == "session" else "event",
+                    text=text,
+                    created_at="2026-03-29T00:00:00+00:00",
+                    last_accessed_at="2026-03-29T00:00:00+00:00",
+                    importance=0.75 if "answer" in corpus_id else 0.55,
+                    metadata=metadata,
+                ),
+                score=cosine_similarity(query_vector, embedder.embed(text)),
+                embedding_model=embedder.model_name,
+                age_days=_retrieval_age_days(instance.get("question_date", ""), timestamp),
+            )
+        )
+
+    reranked = rerank_with_critic(query, hits, critic)
+    rankings = [hit.record.metadata["rank_index"] for hit in reranked]
+    correct_docs = list(set(doc_id for doc_id in corpus_ids if "answer" in doc_id))
+    metrics = {"session": {}, "turn": {}}
+    for k in [1, 3, 5, 10, 30, 50]:
+        recall_any, recall_all, ndcg_any = evaluate_official_retrieval(rankings, correct_docs, corpus_ids, k=k)
+        metrics[granularity].update(
+            {
+                f"recall_any@{k}": recall_any,
+                f"recall_all@{k}": recall_all,
+                f"ndcg_any@{k}": ndcg_any,
+            }
+        )
+        if granularity == "turn":
+            recall_any, recall_all, ndcg_any = evaluate_official_retrieval_turn2session(rankings, correct_docs, corpus_ids, k=k)
+            metrics["session"].update(
+                {
+                    f"recall_any@{k}": recall_any,
+                    f"recall_all@{k}": recall_all,
+                    f"ndcg_any@{k}": ndcg_any,
+                }
+            )
+
+    return {
+        "question_id": instance.get("question_id"),
+        "question_type": instance.get("question_type"),
+        "question": instance.get("question"),
+        "answer": instance.get("answer"),
+        "question_date": instance.get("question_date"),
+        "haystack_dates": instance.get("haystack_dates"),
+        "haystack_sessions": instance.get("haystack_sessions"),
+        "haystack_session_ids": instance.get("haystack_session_ids"),
+        "answer_session_ids": instance.get("answer_session_ids"),
+        "retrieval_results": {
+            "query": query,
+            "ranked_items": [
+                {
+                    "corpus_id": corpus_ids[rid],
+                    "text": corpus[rid],
+                    "timestamp": corpus_timestamps[rid],
+                }
+                for rid in rankings
+            ],
+            "metrics": metrics,
+        },
+    }
+
+
+def summarize_official_retrieval_logs(entries):
+    filtered = [x for x in entries if "_abs" not in x["question_id"]]
+    metric_names = {
+        "session": ["recall_all@5", "ndcg_any@5", "recall_all@10", "ndcg_any@10"],
+        "turn": ["recall_all@5", "ndcg_any@5", "recall_all@10", "ndcg_any@10", "recall_all@50", "ndcg_any@50"],
+    }
+    summary = {
+        "examples": len(entries),
+        "reported_examples": len(filtered),
+        "session": {},
+        "turn": {},
+    }
+    for level, names in metric_names.items():
+        available = []
+        for name in names:
+            values = []
+            for entry in filtered:
+                metrics = entry.get("retrieval_results", {}).get("metrics", {}).get(level, {})
+                if name in metrics:
+                    has_user_target = any(
+                        turn.get("has_answer")
+                        for session in entry.get("haystack_sessions", [])
+                        for turn in session
+                        if turn.get("role") == "user"
+                    )
+                    if has_user_target:
+                        values.append(metrics[name])
+            if values:
+                summary[level][name] = float(np.mean(values))
+                available.append(name)
+        if not available:
+            summary.pop(level, None)
+    return summary
 
 
 def _extract_activity_type(text):
@@ -1607,7 +1886,12 @@ def _build_episode_memory(session_id, session_date, session, include_assistant_t
     )
     summary_lines = [_compact_turn_text(turn, session_date) for turn in snippets]
     entities = _session_entities(session)
-    summary_text = "\n".join(summary_lines) if summary_lines else format_session_text(session_id, session_date, session)
+    summary_text = "\n".join(summary_lines) if summary_lines else format_session_text(
+        session_id,
+        session_date,
+        session,
+        include_assistant_turns=include_assistant_turns,
+    )
     event_meta = _build_event_items(summary_text, session_date, session_id=session_id, role="summary")
     date_value = event_meta["event_date"] or normalize_date(session_date)
     return {
@@ -1643,7 +1927,12 @@ def _build_timeline_memory(session_id, session_date, session, include_assistant_
     for turn in snippets:
         content = _trim(turn.get("content") or "", limit=120)
         facts.append(f"{date_value}: {content}" if date_value else content)
-    timeline_text = "\n".join(facts) if facts else format_session_text(session_id, session_date, session)
+    timeline_text = "\n".join(facts) if facts else format_session_text(
+        session_id,
+        session_date,
+        session,
+        include_assistant_turns=include_assistant_turns,
+    )
     entities = _session_entities(session)
     event_meta = _build_event_items(timeline_text, session_date, session_id=session_id, role="timeline")
     return {
@@ -2561,36 +2850,151 @@ def selected_session_recall(selected_hits, answer_session_ids):
 
 def question_policy(plan):
     policy = {
-        "top_k": 24,
-        "max_items": 8,
-        "token_budget": 768,
-        "critic_threshold": 0.52,
-        "maybe_threshold": 0.42,
-        "similarity_threshold": 0.12,
+        "top_k": 60,
+        "max_items": 10,
+        "token_budget": 1000,
+        "critic_threshold": 0.38,
+        "maybe_threshold": 0.30,
+        "similarity_threshold": 0.04,
     }
     if plan.is_temporal:
         policy.update(
             {
-                "top_k": 40,
-                "max_items": 12,
-                "token_budget": 1200,
-                "critic_threshold": 0.44,
-                "maybe_threshold": 0.34,
-                "similarity_threshold": 0.08,
+                "top_k": 80,
+                "max_items": 14,
+                "token_budget": 1400,
+                "critic_threshold": 0.34,
+                "maybe_threshold": 0.26,
+                "similarity_threshold": 0.03,
             }
         )
     elif plan.is_multi_session:
         policy.update(
             {
-                "top_k": 56,
-                "max_items": 7,
-                "token_budget": 960,
-                "critic_threshold": 0.36,
-                "maybe_threshold": 0.28,
-                "similarity_threshold": 0.05,
+                "top_k": 80,
+                "max_items": 10,
+                "token_budget": 1200,
+                "critic_threshold": 0.28,
+                "maybe_threshold": 0.22,
+                "similarity_threshold": 0.03,
             }
         )
     return policy
+
+
+def is_single_session_question(plan):
+    return (plan.question_type or "").startswith("single-session")
+
+
+def single_session_include_assistant_turns(plan, default=False):
+    if plan.question_type == "single-session-assistant":
+        return True
+    return default
+
+
+def multi_session_session_limit(plan):
+    if not plan.is_multi_session:
+        return 0
+    if plan.multi_session_kind in {"count_entries", "count_distinct", "sum_money", "sum_quantity"}:
+        return 8
+    return 6
+
+
+def _choose_single_session_limit(plan, ranked_sessions, max_sessions):
+    if max_sessions <= 1 or not ranked_sessions:
+        return 1
+    top_score, _, top_bucket = ranked_sessions[0]
+    second_score = ranked_sessions[1][0] if len(ranked_sessions) > 1 else float("-inf")
+    top_hit = top_bucket.get("best_hit")
+    exact_matches = len(_single_session_exact_target_matches(plan, top_hit)) if top_hit is not None else 0
+    if exact_matches == 0:
+        return min(max_sessions, 3)
+    if top_score < 6.0:
+        return min(max_sessions, 3)
+    if len(ranked_sessions) > 1 and (top_score - second_score) < 1.5:
+        return min(max_sessions, 2)
+    return 1
+
+
+def select_raw_session_hits(plan, hits, max_sessions=1):
+    hits = [
+        hit
+        for hit in hits
+        if hit.record.memory_type != "aggregate"
+        and hit.record.metadata.get("granularity") != "aggregate"
+        and hit.record.metadata.get("session_id")
+    ]
+    session_buckets = {}
+    for hit in hits:
+        session_id = hit.record.metadata.get("session_id")
+        if not session_id:
+            continue
+        bucket = session_buckets.setdefault(
+            session_id,
+            {
+                "best_hit": None,
+                "best_episode_hit": None,
+                "best_score": float("-inf"),
+                "best_episode_score": float("-inf"),
+                "hits": [],
+                "scores": [],
+            },
+        )
+        bucket["hits"].append(hit)
+        hit_score = _candidate_selection_score(plan, hit)
+        bucket["scores"].append(hit_score)
+        granularity = _granularity(hit)
+        if granularity == "episode":
+            hit_score += 0.3
+        elif granularity == "timeline":
+            hit_score += 0.2
+        elif granularity == "fact":
+            hit_score += 0.9
+        if hit.critic_label == "use":
+            hit_score += 0.2
+        elif hit.critic_label == "maybe":
+            hit_score += 0.05
+        if is_single_session_question(plan):
+            exact_matches = _single_session_exact_target_matches(plan, hit)
+            hit_score += 2.5 * len(exact_matches)
+            if exact_matches:
+                hit_score += 0.8
+            if len(_target_matches(plan, hit)) == 0:
+                hit_score -= 1.5
+        if bucket["best_hit"] is None or hit_score > bucket["best_score"]:
+            bucket["best_hit"] = hit
+            bucket["best_score"] = hit_score
+        if granularity == "episode" and hit_score > bucket["best_episode_score"]:
+            bucket["best_episode_hit"] = hit
+            bucket["best_episode_score"] = hit_score
+
+    ranked_sessions = []
+    for session_id, bucket in session_buckets.items():
+        aggregate_score = bucket["best_score"]
+        top_scores = sorted(bucket["scores"], reverse=True)
+        aggregate_score += 0.18 * min(len(bucket["hits"]), 3)
+        aggregate_score += 0.12 * sum(top_scores[1:3])
+        episode_hits = sum(
+            1 for hit in bucket["hits"] if hit.record.metadata.get("granularity") == "episode"
+        )
+        aggregate_score += 0.08 * min(episode_hits, 2)
+        ranked_sessions.append((aggregate_score, session_id, bucket))
+
+    ranked_sessions.sort(key=lambda item: item[0], reverse=True)
+    chosen_limit = max_sessions
+    if is_single_session_question(plan):
+        chosen_limit = _choose_single_session_limit(plan, ranked_sessions, max_sessions)
+    chosen_session_ids = [session_id for _, session_id, _ in ranked_sessions[:chosen_limit]]
+    selected_hits = []
+    for session_id in chosen_session_ids:
+        best_hit = (
+            session_buckets[session_id]["best_episode_hit"]
+            or session_buckets[session_id]["best_hit"]
+        )
+        if best_hit is not None:
+            selected_hits.append(best_hit)
+    selected_hits.sort(key=lambda hit: _candidate_selection_score(plan, hit), reverse=True)
+    return selected_hits, chosen_session_ids
 
 
 def _target_matches(plan, hit):
@@ -2625,8 +3029,52 @@ def _target_matches(plan, hit):
     return matches
 
 
+def _single_session_exact_target_matches(plan, hit):
+    if not is_single_session_question(plan):
+        return []
+    metadata = hit.record.metadata
+    exact_matches = []
+    normalized_text = normalize_answer(
+        " ".join(
+            value
+            for value in (
+                metadata.get("summary", ""),
+                metadata.get("fact_text", ""),
+                hit.record.text,
+            )
+            if value
+        )
+    )
+    aliases = {
+        _normalize_target_text(value)
+        for value in metadata.get("event_aliases", [])
+        if value
+    }
+    entities = {
+        _normalize_target_text(value)
+        for value in metadata.get("entities", [])
+        if value
+    }
+    for raw, normalized in zip(plan.targets, plan.normalized_targets):
+        if not normalized:
+            continue
+        target_aliases = {normalized, *_target_aliases(raw)}
+        if any(alias and (alias in aliases or alias in entities) for alias in target_aliases):
+            exact_matches.append(raw)
+            continue
+        for alias in target_aliases:
+            if not alias:
+                continue
+            if normalized_text == alias or f" {alias} " in f" {normalized_text} ":
+                exact_matches.append(raw)
+                break
+    return exact_matches
+
+
 def _target_coverage(plan, hit):
     matches = {_normalize_target_text(value) for value in _target_matches(plan, hit)}
+    if is_single_session_question(plan):
+        matches.update(_normalize_target_text(value) for value in _single_session_exact_target_matches(plan, hit))
     metadata = hit.record.metadata
     source_text = " ".join(
         value
@@ -2684,6 +3132,31 @@ def _granularity_priority(hit):
 
 
 def _candidate_selection_score(plan, hit):
+    if is_single_session_question(plan):
+        metadata = hit.record.metadata
+        granularity = metadata.get("granularity")
+        if hit.record.memory_type == "aggregate" or granularity == "aggregate" or not metadata.get("session_id"):
+            return float("-inf")
+        score = (
+            (2.0 * hit.score)
+            + (1.8 * hit.critic_confidence)
+            + (0.4 * hit.record.importance)
+        )
+        if granularity == "episode":
+            score += 0.25
+        elif granularity == "fact":
+            score += 0.85
+        elif granularity == "timeline":
+            score += 0.1
+        exact_match_count = len(_single_session_exact_target_matches(plan, hit))
+        loose_match_count = len(_target_matches(plan, hit))
+        score += 3.0 * exact_match_count
+        score += 0.5 * loose_match_count
+        if exact_match_count == 0 and loose_match_count == 0:
+            score -= 2.5
+        if metadata.get("has_answer"):
+            score += 0.15
+        return score
     if plan.is_multi_session:
         metadata = hit.record.metadata
         blob = normalize_answer(
@@ -3513,9 +3986,9 @@ def build_benchmark_instructions(plan, selected_hits, answerability, base_system
             f"(mode={solver_result.mode}, confidence={solver_result.confidence:.2f}, rationale={solver_result.rationale})."
         )
     if answerability["sufficient"]:
-        parts.append("The evidence table is sufficient. Answer directly and do not reply with 'Insufficient evidence'.")
+        parts.append("The evidence table is sufficient. Answer directly and do NOT reply with 'Insufficient evidence'.")
     else:
-        parts.append("If the evidence table is insufficient, reply exactly: Insufficient evidence.")
+        parts.append("Try to answer from the evidence table. Only reply 'Insufficient evidence' if the evidence contains absolutely no relevant information.")
     parts.append(build_evidence_table(plan, selected_hits, structured_events=structured_events))
     return "\n\n".join(parts)
 

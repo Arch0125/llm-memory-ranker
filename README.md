@@ -13,6 +13,8 @@ The core memory system leaves the generator unchanged. It stores hybrid benchmar
 - `prompt/`: prompt assembly and budget selection
 - `memory_cli.py`: inspect and manage local memories
 - `benchmark_longmemeval_openai.py`: run the same benchmark with OpenAI as the generator
+- `benchmark_longmemeval_retrieval.py`: emit an official-style LongMemEval retrieval log for the local memory retriever
+- `run_longmemeval_protocol.py`: run a comparable LongMemEval protocol across `S full-history`, `S + memory`, and `Oracle upper bound`
 
 ## Quick Start
 
@@ -75,6 +77,78 @@ Current defaults are tuned for LongMemEval temporal questions:
 `output_path` is intentionally compatible with the official LongMemEval evaluation script: each line contains only `question_id` and `hypothesis`. The companion `details_path` file includes local metrics such as exact match, token F1, selected memory count, selected-session recall, answerability, and OpenAI token usage.
 
 To benchmark the hosted model without the memory layer, rerun with `--memory_enabled=False` and compare the two summary JSON files.
+
+## Comparable LongMemEval Protocol
+
+For a more faithful LongMemEval-style comparison, do not compare the memory layer against a question-only baseline. Instead, compare:
+
+- `S full-history baseline`: the reader gets the full `longmemeval_s_cleaned.json` chat history directly
+- `S + memory`: the same reader gets only the retrieved evidence selected by the local memory layer
+- `Oracle upper bound`: the reader gets only the oracle evidence sessions from `longmemeval_oracle.json`
+
+Download the standard data files first:
+
+```sh
+mkdir -p data
+curl -L https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_s_cleaned.json -o data/longmemeval_s_cleaned.json
+curl -L https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_oracle.json -o data/longmemeval_oracle.json
+```
+
+Then run the protocol:
+
+```sh
+export OPENAI_API_KEY=...
+
+./venv/bin/python run_longmemeval_protocol.py \
+  --openai_model=gpt-4.1-mini \
+  --max_examples=100
+```
+
+This will write:
+
+- `reports/longmemeval_protocol/s_full_history_predictions.jsonl`
+- `reports/longmemeval_protocol/s_memory_predictions.jsonl`
+- `reports/longmemeval_protocol/oracle_upper_bound_predictions.jsonl`
+- `reports/longmemeval_protocol/s_memory_retrievallog_session_memory.jsonl`
+- `reports/longmemeval_protocol/s_memory_retrievallog_turn_memory.jsonl`
+- matching `details.jsonl` and `summary.json` files for each condition
+- `reports/longmemeval_protocol/manifest.json`
+
+If you already have a local checkout of the official LongMemEval repo, you can also run the official evaluator on the generated `jsonl` files:
+
+```sh
+./venv/bin/python run_longmemeval_protocol.py \
+  --openai_model=gpt-4.1-mini \
+  --max_examples=100 \
+  --official_repo_path=/path/to/LongMemEval
+```
+
+When `--official_repo_path` is set, the script looks for `evaluate_qa.py` and `print_qa_metrics.py` under that repo and writes the official evaluator output into `reports/longmemeval_protocol/*_official_*.txt`.
+
+It also runs the official retrieval metric printer `print_retrieval_metrics.py` on the generated retrieval logs, so you get both:
+
+- official QA evaluation on `jsonl` predictions
+- official retrieval evaluation on `retrievallog_*` files
+
+You can still use `benchmark_longmemeval_openai.py` directly for one-off conditions. The reader mode is controlled by `--reader_context_mode`:
+
+- `memory`: local memory layer retrieval + evidence table
+- `full-history`: feed the full chat history directly to the model
+- `oracle-history`: feed only the answer sessions directly to the model
+- `question-only`: question without history
+
+If you only want the official-style retrieval log without the QA runs:
+
+```sh
+./venv/bin/python benchmark_longmemeval_retrieval.py \
+  --dataset_path=data/longmemeval_s_cleaned.json \
+  --granularity=turn \
+  --max_examples=100 \
+  --output_path=reports/longmemeval_retrievallog_turn_memory.jsonl \
+  --summary_path=reports/longmemeval_retrievallog_turn_memory_summary.json
+```
+
+The resulting `retrievallog_*` file follows the same schema used by the official LongMemEval retrieval pipeline and can be passed to the official `print_retrieval_metrics.py`.
 
 ## Memory Layer
 

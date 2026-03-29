@@ -2,7 +2,7 @@ from dataclasses import dataclass, field
 
 from memory.critic import HeuristicCritic, rerank_with_critic
 from memory.explain import build_trace
-from memory.retrieve import gate_hits, infer_capture_type, parse_type_allowlist, retrieve_candidates
+from memory.retrieve import gate_hits, infer_capture_type, parse_type_allowlist, retrieve_candidates, retrieve_hybrid_candidates
 from prompt.budget import select_memories
 from prompt.template import DEFAULT_SYSTEM_PROMPT, assemble_prompt
 
@@ -29,16 +29,26 @@ class MemoryAwareInference:
         self.critic = critic or HeuristicCritic()
         self.config = config or MemoryAwareConfig()
 
-    def rank_hits(self, query_text):
+    def rank_hits(self, query_text, hybrid=False):
         type_allowlist = parse_type_allowlist(self.config.type_allowlist)
-        retrieved = retrieve_candidates(
-            query_text=query_text,
-            store=self.store,
-            embedder=self.embedder,
-            user_id=self.config.user_id,
-            top_k=self.config.top_k,
-            type_allowlist=type_allowlist,
-        )
+        if hybrid:
+            retrieved = retrieve_hybrid_candidates(
+                query_text=query_text,
+                store=self.store,
+                embedder=self.embedder,
+                user_id=self.config.user_id,
+                top_k=self.config.top_k,
+                type_allowlist=type_allowlist,
+            )
+        else:
+            retrieved = retrieve_candidates(
+                query_text=query_text,
+                store=self.store,
+                embedder=self.embedder,
+                user_id=self.config.user_id,
+                top_k=self.config.top_k,
+                type_allowlist=type_allowlist,
+            )
         gated = gate_hits(
             retrieved,
             sim_threshold=self.config.similarity_threshold,

@@ -15,18 +15,23 @@ from benchmarks.longmemeval import (
     analyze_question,
     abstention_score,
     assess_answerability,
+    build_history_context,
     build_benchmark_instructions,
     build_structured_event_view,
     contains_match_score,
     exact_match_score,
+    is_single_session_question,
     iter_history_memories,
     load_longmemeval_instances,
+    multi_session_session_limit,
     postprocess_prediction,
     question_policy,
     render_evidence_line,
+    select_raw_session_hits,
     select_bundled_hits,
     selected_session_ids,
     selected_session_recall,
+    single_session_include_assistant_turns,
     solve_temporal_question,
     summarize_records,
     token_f1_score,
@@ -66,6 +71,8 @@ memory_explain = False
 memory_solver_mode = "hybrid"
 memory_solver_min_confidence = 0.72
 memory_structured_event_limit = 4
+reader_context_mode = "auto"
+history_format = "nl"
 openai_api_key = ""
 openai_base_url = "https://api.openai.com/v1"
 openai_model = "gpt-4.1-mini"
@@ -77,10 +84,11 @@ exec(open("configurator.py").read())  # overrides from command line or config fi
 # -----------------------------------------------------------------------------
 
 
-def _build_baseline_instructions(plan, recent_context="", base_system_prompt=None):
+def _build_baseline_instructions(plan, history_context="", base_system_prompt=None):
     parts = [base_system_prompt or DEFAULT_SYSTEM_PROMPT]
-    if recent_context:
-        parts.append(f"Recent context:\n{recent_context.strip()}")
+    if history_context:
+        parts.append("Use only the provided chat history as evidence. If the answer is not supported by the history, respond with 'Insufficient evidence'.")
+        parts.append(f"Chat history:\n{history_context.strip()}")
     if plan.is_multi_session:
         if plan.multi_session_kind in {"count_entries", "count_distinct"}:
             parts.append("Return only the final number.")
@@ -103,6 +111,39 @@ def _build_baseline_instructions(plan, recent_context="", base_system_prompt=Non
     else:
         parts.append("Return only the final answer.")
     return "\n\n".join(parts)
+
+
+def _build_memory_session_instructions(plan, session_context="", evidence_sufficient=False, base_system_prompt=None):
+    parts = [base_system_prompt or DEFAULT_SYSTEM_PROMPT]
+    parts.append("Use the selected supporting session excerpts below to answer the question. Base your answer only on what is stated in those excerpts.")
+    if session_context:
+        parts.append(f"Selected supporting session excerpts:\n{session_context.strip()}")
+    if plan.is_multi_session:
+        parts.append("For multi-session questions, combine information across all the selected session excerpts. Count or aggregate all relevant items mentioned.")
+        parts.append("Return only the final answer.")
+    elif plan.reasoning_kind == "ordering":
+        parts.append("Return only the event or item that happened first or last.")
+        if plan.targets:
+            parts.append("Valid answer options: " + " | ".join(plan.targets))
+    elif plan.reasoning_kind == "difference":
+        unit = plan.unit_hint or "days"
+        parts.append(f"Return only the final duration like '7 {unit}'.")
+    elif plan.reasoning_kind == "date":
+        parts.append("Return only the final date or short date phrase.")
+    else:
+        parts.append("Return only the final answer, even if the evidence is partial. Prefer giving a best-effort answer over abstaining.")
+    if evidence_sufficient:
+        parts.append("The excerpts contain sufficient evidence. Answer directly from them. Do NOT reply with 'Insufficient evidence'.")
+    else:
+        parts.append("Try to extract an answer from the excerpts. Only reply 'Insufficient evidence' if the excerpts contain absolutely no relevant information.")
+    return "\n\n".join(parts)
+
+
+def _resolved_reader_context_mode():
+    mode = (reader_context_mode or "auto").strip().lower()
+    if mode == "auto":
+        return "memory" if memory_enabled else "question-only"
+    return mode
 
 
 def _effective_policy(plan):
@@ -136,7 +177,9 @@ def _make_memory_system(store, embedder, policy):
 
 
 def _solver_allowed_reasoning_kind(plan):
-    return plan.reasoning_kind in {"ordering", "date"} or plan.is_multi_session
+    if plan.is_multi_session:
+        return plan.multi_session_kind == "time_lookup"
+    return plan.reasoning_kind in {"ordering", "date"}
 
 
 def _solver_can_prompt(plan, solver_result):
@@ -144,12 +187,11 @@ def _solver_can_prompt(plan, solver_result):
         return False
     if not plan.is_multi_session:
         return True
-    return solver_result.mode in {
-        "multi-session-sum-money",
-        "multi-session-difference-money",
-        "multi-session-time-lookup",
-        "multi-session-max-value",
-    } or solver_result.confidence >= 0.9
+    return (
+        solver_result.mode == "multi-session-time-lookup"
+        and solver_result.confidence >= max(0.92, memory_solver_min_confidence)
+        and len(solver_result.supporting_memory_ids) >= 2
+    )
 
 
 def _solver_can_finalize(plan, solver_result):
@@ -157,12 +199,11 @@ def _solver_can_finalize(plan, solver_result):
         return False
     if not plan.is_multi_session:
         return True
-    return solver_result.mode in {
-        "multi-session-sum-money",
-        "multi-session-difference-money",
-        "multi-session-time-lookup",
-        "multi-session-max-value",
-    } and solver_result.confidence >= memory_solver_min_confidence
+    return (
+        solver_result.mode == "multi-session-time-lookup"
+        and solver_result.confidence >= max(0.92, memory_solver_min_confidence)
+        and len(solver_result.supporting_memory_ids) >= 2
+    )
 
 
 def _structured_events_for_prompt(plan, structured_events, solver_result):
@@ -214,6 +255,11 @@ def _write_jsonl(path, rows):
 
 if history_granularity not in {"turn", "session", "hybrid"}:
     raise ValueError("history_granularity must be 'turn', 'session', or 'hybrid'")
+if history_format not in {"nl", "json"}:
+    raise ValueError("history_format must be 'nl' or 'json'")
+resolved_context_mode = _resolved_reader_context_mode()
+if resolved_context_mode not in {"memory", "question-only", "full-history", "oracle-history"}:
+    raise ValueError("reader_context_mode must be one of auto, memory, question-only, full-history, oracle-history")
 
 resolved_api_key = openai_api_key or os.getenv("OPENAI_API_KEY", "")
 if not resolved_api_key:
@@ -242,6 +288,7 @@ for index, instance in enumerate(instances, start=1):
         structured_events = []
         solver_result = None
         trace = None
+        history_context = ""
         answerability = {
             "sufficient": False,
             "reasons": ["no-memory-mode"],
@@ -250,37 +297,94 @@ for index, instance in enumerate(instances, start=1):
             "covered_targets": [],
         }
 
-        if memory_enabled:
+        if resolved_context_mode == "memory":
             _ingest_history(store, embedder, instance)
             policy = _effective_policy(plan)
             memory_system = _make_memory_system(store, embedder, policy)
-            reranked = memory_system.rank_hits(query_text)
+            reranked = memory_system.rank_hits(query_text, hybrid=True)
             candidate_hits = [
                 hit
                 for hit in reranked
-                if hit.critic_label != "ignore" or hit.critic_confidence >= max(0.24, policy["maybe_threshold"] - 0.08)
+                if hit.critic_label != "ignore" or hit.critic_confidence >= max(0.16, policy["maybe_threshold"] - 0.12)
             ]
-            selected_hits, _ = select_bundled_hits(
-                plan,
-                candidate_hits,
-                max_items=policy["max_items"],
-                max_tokens=policy["token_budget"],
-                encode=None,
-            )
-            answerability = assess_answerability(plan, selected_hits)
-            structured_events = build_structured_event_view(
-                plan,
-                selected_hits,
-                limit=memory_structured_event_limit,
-            )
-            solver_result = solve_temporal_question(plan, selected_hits)
+            if is_single_session_question(plan):
+                selected_hits, raw_session_ids = select_raw_session_hits(
+                    plan,
+                    candidate_hits,
+                    max_sessions=3,
+                )
+                history_context = build_history_context(
+                    instance,
+                    include_assistant_turns=single_session_include_assistant_turns(
+                        plan,
+                        default=include_assistant_turns,
+                    ),
+                    history_format=history_format,
+                    allowed_session_ids=raw_session_ids,
+                )
+                answerability = {
+                    "sufficient": bool(raw_session_ids),
+                    "reasons": ["raw-session-selected"] if raw_session_ids else ["missing-session"],
+                    "distinct_dates": [],
+                    "distinct_sessions": list(raw_session_ids),
+                    "covered_targets": [],
+                }
+                structured_events = []
+                solver_result = None
+            elif plan.is_multi_session:
+                selected_hits, raw_session_ids = select_raw_session_hits(
+                    plan,
+                    candidate_hits,
+                    max_sessions=multi_session_session_limit(plan),
+                )
+                history_context = build_history_context(
+                    instance,
+                    include_assistant_turns=include_assistant_turns,
+                    history_format=history_format,
+                    allowed_session_ids=raw_session_ids,
+                )
+                session_hits = [
+                    hit
+                    for hit in candidate_hits
+                    if hit.record.metadata.get("session_id") in set(raw_session_ids)
+                    and hit.record.memory_type != "aggregate"
+                    and hit.record.metadata.get("granularity") != "aggregate"
+                ]
+                answerability = {
+                    "sufficient": len(raw_session_ids) >= 2,
+                    "reasons": ["raw-multi-session-selected"] if raw_session_ids else ["missing-session"],
+                    "distinct_dates": [],
+                    "distinct_sessions": list(raw_session_ids),
+                    "covered_targets": [],
+                }
+                structured_events = []
+                solver_result = solve_temporal_question(plan, session_hits) if session_hits else None
+            else:
+                selected_hits, _ = select_bundled_hits(
+                    plan,
+                    candidate_hits,
+                    max_items=policy["max_items"],
+                    max_tokens=policy["token_budget"],
+                    encode=None,
+                )
+                answerability = assess_answerability(plan, selected_hits)
+                structured_events = build_structured_event_view(
+                    plan,
+                    selected_hits,
+                    limit=memory_structured_event_limit,
+                )
+                solver_result = solve_temporal_question(plan, selected_hits)
             for hit in selected_hits:
                 store.mark_retrieved(hit.record.memory_id)
             trace = build_trace(
                 query_text=query_text,
                 retrieved_hits=reranked,
                 selected_hits=selected_hits,
-                prompt_text="\n".join(render_evidence_line(hit, index=i + 1) for i, hit in enumerate(selected_hits)),
+                prompt_text=(
+                    history_context
+                    if history_context
+                    else "\n".join(render_evidence_line(hit, index=i + 1) for i, hit in enumerate(selected_hits))
+                ),
             )
         prompt_structured_events = _structured_events_for_prompt(
             plan,
@@ -288,31 +392,56 @@ for index, instance in enumerate(instances, start=1):
             solver_result,
         )
 
-        if memory_enabled:
-            instructions = build_benchmark_instructions(
-                plan=plan,
-                selected_hits=selected_hits,
-                answerability=answerability,
-                base_system_prompt=DEFAULT_SYSTEM_PROMPT,
-                structured_events=prompt_structured_events,
-                solver_result=(
-                    solver_result
-                    if solver_result
-                    and solver_result.resolved
-                    and _solver_allowed_reasoning_kind(plan)
-                    and _solver_can_prompt(plan, solver_result)
-                    and solver_result.confidence >= max(0.55, memory_solver_min_confidence - 0.1)
-                    else None
-                ),
-            )
+        if resolved_context_mode == "memory":
+            if (is_single_session_question(plan) or plan.is_multi_session) and history_context:
+                instructions = _build_memory_session_instructions(
+                    plan=plan,
+                    session_context=history_context,
+                    evidence_sufficient=answerability["sufficient"],
+                    base_system_prompt=DEFAULT_SYSTEM_PROMPT,
+                )
+            else:
+                instructions = build_benchmark_instructions(
+                    plan=plan,
+                    selected_hits=selected_hits,
+                    answerability=answerability,
+                    base_system_prompt=DEFAULT_SYSTEM_PROMPT,
+                    structured_events=prompt_structured_events,
+                    solver_result=(
+                        solver_result
+                        if solver_result
+                        and solver_result.resolved
+                        and _solver_allowed_reasoning_kind(plan)
+                        and _solver_can_prompt(plan, solver_result)
+                        and solver_result.confidence >= max(0.92, memory_solver_min_confidence)
+                        else None
+                    ),
+                )
         else:
+            if resolved_context_mode == "full-history":
+                history_context = build_history_context(
+                    instance,
+                    include_assistant_turns=include_assistant_turns,
+                    answer_sessions_only=False,
+                    history_format=history_format,
+                )
+            elif resolved_context_mode == "oracle-history":
+                history_context = build_history_context(
+                    instance,
+                    include_assistant_turns=include_assistant_turns,
+                    answer_sessions_only=True,
+                    history_format=history_format,
+                )
+            else:
+                history_context = memory_recent_context
             instructions = _build_baseline_instructions(
                 plan=plan,
-                recent_context=memory_recent_context,
+                history_context=history_context,
                 base_system_prompt=DEFAULT_SYSTEM_PROMPT,
             )
         use_solver_directly = bool(
-            memory_enabled
+            resolved_context_mode == "memory"
+            and not is_single_session_question(plan)
             and solver_result is not None
             and solver_result.resolved
             and _solver_allowed_reasoning_kind(plan)
@@ -322,7 +451,8 @@ for index, instance in enumerate(instances, start=1):
         )
         if memory_solver_mode == "finalize":
             use_solver_directly = bool(
-                memory_enabled
+                resolved_context_mode == "memory"
+                and not is_single_session_question(plan)
                 and solver_result is not None
                 and solver_result.resolved
                 and _solver_allowed_reasoning_kind(plan)
@@ -355,7 +485,8 @@ for index, instance in enumerate(instances, start=1):
                     metadata={
                         "benchmark": "longmemeval",
                         "question_id": question_id,
-                        "memory_enabled": memory_enabled,
+                        "memory_enabled": resolved_context_mode == "memory",
+                        "reader_context_mode": resolved_context_mode,
                     },
                     reasoning_effort=openai_reasoning_effort,
                     verbosity=openai_verbosity,
@@ -412,6 +543,9 @@ for index, instance in enumerate(instances, start=1):
             ),
             "answerable": answerability["sufficient"],
             "answerability_reasons": answerability["reasons"],
+            "reader_context_mode": resolved_context_mode,
+            "history_session_count": len(instance.get("haystack_session_ids", [])),
+            "history_context_chars": len(history_context),
             "solver_resolved": bool(solver_result and solver_result.resolved),
             "solver_confidence": solver_result.confidence if solver_result else 0.0,
             "solver_answer": solver_result.answer if solver_result else "",
@@ -427,8 +561,10 @@ summary.update(
     {
         "dataset_path": dataset_path,
         "memory_enabled": memory_enabled,
+        "reader_context_mode": resolved_context_mode,
         "history_granularity": history_granularity,
         "include_assistant_turns": include_assistant_turns,
+        "history_format": history_format,
         "memory_solver_mode": memory_solver_mode,
         "memory_solver_min_confidence": memory_solver_min_confidence,
         "openai_model": openai_model,
