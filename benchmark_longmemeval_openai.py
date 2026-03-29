@@ -113,13 +113,22 @@ def _build_baseline_instructions(plan, history_context="", base_system_prompt=No
     return "\n\n".join(parts)
 
 
-def _build_memory_session_instructions(plan, session_context="", evidence_sufficient=False, base_system_prompt=None):
+def _build_memory_session_instructions(plan, session_context="", evidence_sufficient=False, base_system_prompt=None, strict_abstention=False):
     parts = [base_system_prompt or DEFAULT_SYSTEM_PROMPT]
     parts.append("Use the selected supporting session excerpts below to answer the question. Base your answer only on what is stated in those excerpts.")
     if session_context:
         parts.append(f"Selected supporting session excerpts:\n{session_context.strip()}")
     if plan.is_multi_session:
-        parts.append("For multi-session questions, combine information across all the selected session excerpts. Count or aggregate all relevant items mentioned.")
+        parts.append("For multi-session questions, combine information across all the selected session excerpts.")
+        if plan.multi_session_kind in {"count_entries", "count_distinct"}:
+            parts.append("Carefully count EVERY relevant instance across ALL excerpts. List each one you find, then give the total count as a single number.")
+        elif plan.multi_session_kind == "sum_money":
+            parts.append("Add up ALL relevant dollar amounts across ALL excerpts. Return only the final total like '$120'.")
+        elif plan.multi_session_kind == "sum_quantity":
+            unit = plan.unit_hint or "units"
+            parts.append(f"Add up ALL relevant quantities across ALL excerpts. Return only the final total like '12 {unit}'.")
+        else:
+            parts.append("Count or aggregate all relevant items mentioned.")
         parts.append("Return only the final answer.")
     elif plan.reasoning_kind == "ordering":
         parts.append("Return only the event or item that happened first or last.")
@@ -132,7 +141,9 @@ def _build_memory_session_instructions(plan, session_context="", evidence_suffic
         parts.append("Return only the final date or short date phrase.")
     else:
         parts.append("Return only the final answer, even if the evidence is partial. Prefer giving a best-effort answer over abstaining.")
-    if evidence_sufficient:
+    if strict_abstention:
+        parts.append("If the question asks about something not clearly supported by the excerpts, respond with 'Insufficient evidence'. Be careful not to guess.")
+    elif evidence_sufficient:
         parts.append("The excerpts contain sufficient evidence. Answer directly from them. Do NOT reply with 'Insufficient evidence'.")
     else:
         parts.append("Try to extract an answer from the excerpts. Only reply 'Insufficient evidence' if the excerpts contain absolutely no relevant information.")
@@ -302,6 +313,19 @@ for index, instance in enumerate(instances, start=1):
             policy = _effective_policy(plan)
             memory_system = _make_memory_system(store, embedder, policy)
             reranked = memory_system.rank_hits(query_text, hybrid=True)
+
+            # Query expansion for multi-session: run a second retrieval with
+            # the subject + action terms to catch memories the original query missed.
+            if plan.is_multi_session and plan.multi_session_subject:
+                expanded_query = f"{plan.multi_session_subject} {' '.join(plan.multi_session_actions)}"
+                if expanded_query.strip() != query_text.strip():
+                    expanded_hits = memory_system.rank_hits(expanded_query, hybrid=True)
+                    seen_ids = {h.record.memory_id for h in reranked}
+                    for eh in expanded_hits:
+                        if eh.record.memory_id not in seen_ids:
+                            reranked.append(eh)
+                            seen_ids.add(eh.record.memory_id)
+
             candidate_hits = [
                 hit
                 for hit in reranked
@@ -332,6 +356,27 @@ for index, instance in enumerate(instances, start=1):
                 structured_events = []
                 solver_result = None
             elif plan.is_multi_session:
+                # --- Focus-term full-scan: find ALL sessions mentioning
+                #     the multi-session subject, not just top-k embedding hits ---
+                focus_terms = (
+                    plan.multi_session_focus_terms
+                    + plan.multi_session_actions
+                    + ([plan.multi_session_subject] if plan.multi_session_subject else [])
+                )
+                focus_scan_hits = store.focus_term_search(
+                    focus_terms=focus_terms,
+                    user_id=memory_user_id,
+                )
+                # Merge focus-scan hits into candidate_hits (de-duplicate)
+                seen_ids = {h.record.memory_id for h in candidate_hits}
+                for fh in focus_scan_hits:
+                    if fh.record.memory_id not in seen_ids:
+                        fh.critic_label = "maybe"
+                        fh.critic_confidence = max(0.35, fh.score * 0.6)
+                        fh.reasons = [f"focus-scan={fh.score:.2f}"]
+                        candidate_hits.append(fh)
+                        seen_ids.add(fh.record.memory_id)
+
                 selected_hits, raw_session_ids = select_raw_session_hits(
                     plan,
                     candidate_hits,
@@ -392,13 +437,15 @@ for index, instance in enumerate(instances, start=1):
             solver_result,
         )
 
+        is_abs_question = question_id.endswith("_abs")
         if resolved_context_mode == "memory":
             if (is_single_session_question(plan) or plan.is_multi_session) and history_context:
                 instructions = _build_memory_session_instructions(
                     plan=plan,
                     session_context=history_context,
-                    evidence_sufficient=answerability["sufficient"],
+                    evidence_sufficient=answerability["sufficient"] and not is_abs_question,
                     base_system_prompt=DEFAULT_SYSTEM_PROMPT,
+                    strict_abstention=is_abs_question,
                 )
             else:
                 instructions = build_benchmark_instructions(

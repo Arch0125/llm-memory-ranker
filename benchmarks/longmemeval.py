@@ -4011,13 +4011,23 @@ def postprocess_prediction(plan, text):
     )
     if plan.is_multi_session:
         if plan.multi_session_kind in {"count_entries", "count_distinct"}:
+            # Try digit first
             match = re.search(r"\b\d+\b", value)
             if match:
                 return match.group(0)
+            # Try number words ("three" → "3")
+            for word, num in _NUMBER_WORDS.items():
+                if re.search(r'\b' + re.escape(word) + r'\b', lowered_value):
+                    return str(num)
         if plan.multi_session_kind == "sum_money":
             money_match = _MONEY_RE.search(value)
             if money_match:
                 return _format_money(_parse_amount_token(money_match.group(0)))
+            # Try bare number with dollar context
+            if "dollar" in lowered_value or "$" in value or "spent" in lowered_value:
+                num_match = re.search(r"\b\d+(?:\.\d+)?\b", value)
+                if num_match:
+                    return _format_money(float(num_match.group(0)))
         if plan.multi_session_kind == "sum_quantity":
             unit = _normalize_unit(plan.unit_hint or "")
             for quantity_match in _QUANTITY_RE.finditer(value):

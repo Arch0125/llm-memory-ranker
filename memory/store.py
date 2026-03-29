@@ -242,6 +242,76 @@ class SQLiteMemoryStore:
         hits.sort(key=lambda hit: hit.score, reverse=True)
         return hits[:top_k]
 
+    def focus_term_search(
+        self,
+        focus_terms,
+        user_id,
+        status="active",
+        min_terms=1,
+    ):
+        """Return ALL memories that mention at least *min_terms* of the given
+        focus terms.  Unlike keyword_search this has no top_k cap -- it is
+        designed for multi-session aggregation where we must find every
+        relevant session, not just the best few.
+
+        Each returned MemoryHit gets a score equal to the fraction of
+        focus_terms matched (0.0-1.0).
+        """
+        if not focus_terms:
+            return []
+        normalized_terms = set()
+        for term in focus_terms:
+            for token in tokenize(term, drop_stopwords=True):
+                if len(token) >= 3:
+                    normalized_terms.add(token)
+        if not normalized_terms:
+            return []
+
+        rows = self.conn.execute(
+            """
+            SELECT m.*
+            FROM memory_item m
+            WHERE m.user_id = ? AND m.status = ?
+            """,
+            (user_id, status),
+        ).fetchall()
+
+        hits = []
+        now = utc_now()
+        for row in rows:
+            text = row["text"]
+            metadata = json.loads(row["metadata_json"] or "{}")
+            searchable = " ".join(
+                v for v in (
+                    text,
+                    metadata.get("fact_text", ""),
+                    metadata.get("summary", ""),
+                    " ".join(metadata.get("entities", [])),
+                    " ".join(metadata.get("event_aliases", [])),
+                    " ".join(metadata.get("aggregate_labels", [])),
+                )
+                if v
+            )
+            doc_tokens = set(tokenize(searchable, drop_stopwords=True))
+            matched = normalized_terms & doc_tokens
+            if len(matched) < min_terms:
+                continue
+
+            score = len(matched) / len(normalized_terms)
+            record = self._record_from_row(row)
+            age_days = max(0, (now - parse_timestamp(record.last_accessed_at)).days)
+            hits.append(
+                MemoryHit(
+                    record=record,
+                    score=score,
+                    embedding_model="focus-scan",
+                    age_days=age_days,
+                )
+            )
+
+        hits.sort(key=lambda h: h.score, reverse=True)
+        return hits
+
     def keyword_search(
         self,
         query_text,

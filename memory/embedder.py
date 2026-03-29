@@ -98,7 +98,7 @@ class SentenceTransformerEmbedder(BaseEmbedder):
 
 
 class BenchmarkAutoEmbedder(BaseEmbedder):
-    def __init__(self, preferred_model="all-MiniLM-L6-v2"):
+    def __init__(self, preferred_model="all-mpnet-base-v2"):
         try:
             delegate = SentenceTransformerEmbedder(preferred_model)
         except RuntimeError:
