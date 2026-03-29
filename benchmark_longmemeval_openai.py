@@ -139,6 +139,32 @@ def _solver_allowed_reasoning_kind(plan):
     return plan.reasoning_kind in {"ordering", "date"} or plan.is_multi_session
 
 
+def _solver_can_prompt(plan, solver_result):
+    if not solver_result or not solver_result.resolved:
+        return False
+    if not plan.is_multi_session:
+        return True
+    return solver_result.mode in {
+        "multi-session-sum-money",
+        "multi-session-difference-money",
+        "multi-session-time-lookup",
+        "multi-session-max-value",
+    } or solver_result.confidence >= 0.9
+
+
+def _solver_can_finalize(plan, solver_result):
+    if not solver_result or not solver_result.resolved:
+        return False
+    if not plan.is_multi_session:
+        return True
+    return solver_result.mode in {
+        "multi-session-sum-money",
+        "multi-session-difference-money",
+        "multi-session-time-lookup",
+        "multi-session-max-value",
+    } and solver_result.confidence >= memory_solver_min_confidence
+
+
 def _structured_events_for_prompt(plan, structured_events, solver_result):
     if not structured_events:
         return []
@@ -274,6 +300,7 @@ for index, instance in enumerate(instances, start=1):
                     if solver_result
                     and solver_result.resolved
                     and _solver_allowed_reasoning_kind(plan)
+                    and _solver_can_prompt(plan, solver_result)
                     and solver_result.confidence >= max(0.55, memory_solver_min_confidence - 0.1)
                     else None
                 ),
@@ -289,6 +316,7 @@ for index, instance in enumerate(instances, start=1):
             and solver_result is not None
             and solver_result.resolved
             and _solver_allowed_reasoning_kind(plan)
+            and _solver_can_finalize(plan, solver_result)
             and memory_solver_mode in {"hybrid", "finalize"}
             and solver_result.confidence >= memory_solver_min_confidence
         )
@@ -298,6 +326,7 @@ for index, instance in enumerate(instances, start=1):
                 and solver_result is not None
                 and solver_result.resolved
                 and _solver_allowed_reasoning_kind(plan)
+                and _solver_can_finalize(plan, solver_result)
                 and solver_result.confidence >= memory_solver_min_confidence
             )
         if use_solver_directly:

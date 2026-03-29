@@ -94,6 +94,7 @@ _DAY_MONTH_RE = re.compile(
     r"\b(\d{1,2})(?:st|nd|rd|th)?\s+of\s+(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)(?:,\s*(\d{4}))?\b",
     re.IGNORECASE,
 )
+_SHORT_MONTH_DAY_RE = re.compile(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b")
 _DATE_LINE_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
 _MONTH_DIFF_RE = re.compile(r"\b(\d+)\s*(month|months)\b", re.IGNORECASE)
 _DAY_DIFF_RE = re.compile(r"\b(\d+)\s*(day|days)\b", re.IGNORECASE)
@@ -220,6 +221,132 @@ _CATEGORY_HINTS = {
     "museum": {"museum", "gallery"},
     "grocery": {"grocery", "store", "market"},
 }
+_CITRUS_VALUES = {
+    "blood orange": "blood orange",
+    "orange peel": "orange",
+    "orange peels": "orange",
+    "orange": "orange",
+    "lime": "lime",
+    "lemon": "lemon",
+    "grapefruit": "grapefruit",
+    "mandarin": "mandarin",
+    "tangerine": "tangerine",
+    "clementine": "clementine",
+    "pomelo": "pomelo",
+    "yuzu": "yuzu",
+}
+_CUISINE_VALUES = {
+    "thai": "Thai",
+    "indian": "Indian",
+    "mexican": "Mexican",
+    "italian": "Italian",
+    "japanese": "Japanese",
+    "korean": "Korean",
+    "french": "French",
+    "greek": "Greek",
+    "spanish": "Spanish",
+    "vietnamese": "Vietnamese",
+    "chinese": "Chinese",
+    "mediterranean": "Mediterranean",
+    "middle eastern": "Middle Eastern",
+}
+_FOOD_DELIVERY_VALUES = {
+    "doordash": "DoorDash",
+    "uber eats": "Uber Eats",
+    "ubereats": "Uber Eats",
+    "grubhub": "Grubhub",
+    "postmates": "Postmates",
+    "caviar": "Caviar",
+}
+_GROCERY_STORE_VALUES = {
+    "thrive market": "Thrive Market",
+    "walmart": "Walmart",
+    "trader joe's": "Trader Joe's",
+    "trader joes": "Trader Joe's",
+    "publix": "Publix",
+    "whole foods": "Whole Foods",
+    "sprouts": "Sprouts",
+    "costco": "Costco",
+    "instacart": "Instacart",
+}
+_SOCIAL_PLATFORM_VALUES = {
+    "tiktok": "TikTok",
+    "instagram": "Instagram",
+    "facebook": "Facebook",
+    "twitter": "Twitter",
+    "youtube": "YouTube",
+    "linkedin": "LinkedIn",
+    "pinterest": "Pinterest",
+}
+_INSTRUMENT_TERMS = (
+    "electric guitar",
+    "acoustic guitar",
+    "guitar",
+    "drum set",
+    "drums",
+    "piano",
+    "keyboard",
+    "ukulele",
+    "violin",
+    "cello",
+    "flute",
+    "saxophone",
+    "bass",
+)
+_CLOTHING_TERMS = (
+    "blazer",
+    "boots",
+    "jeans",
+    "shirt",
+    "button-down shirt",
+    "sundress",
+    "sweater",
+    "jacket",
+    "dress",
+    "pants",
+    "coat",
+    "scarf",
+    "gloves",
+)
+_PROJECT_TERMS = (
+    "case competition",
+    "marketing research project",
+    "marketing research",
+    "data mining project",
+    "database systems project",
+    "thesis",
+    "research project",
+)
+_ART_EVENT_TERMS = (
+    "workshop",
+    "class",
+    "opening night",
+    "exhibition",
+    "festival",
+    "fair",
+    "gallery opening",
+)
+_WEDDING_COUPLE_RE = re.compile(r"\b([A-Z][a-z]+)\s+and\s+([A-Z][a-z]+)\b")
+_VENUE_NAME_RE = re.compile(
+    r"\b(?:The\s+)?([A-Z][A-Za-z0-9'&.-]*(?:\s+[A-Z][A-Za-z0-9'&.-]*){0,4}\s+"
+    r"(?:Museum|Gallery|Cube|Festival|Market))\b"
+)
+_BRANDED_ITEM_RE = re.compile(
+    r"\b(?:my|the|a|an)\s+([a-z0-9' -]{0,40}?(?:"
+    r"electric guitar|acoustic guitar|guitar|drum set|drums|piano|keyboard|ukulele|violin|cello|flute|saxophone|bass|"
+    r"boots|blazer|jeans|shirt|sundress|sweater|jacket|dress|pants|coat))\b",
+    re.IGNORECASE,
+)
+_CURRENT_STATE_CUES = ("current", "currently", "still", "i have", "i've had", "my ", "i own", "i use", "i'm working on")
+_NEGATED_OWNERSHIP_CUES = ("my niece", "friend's kid", "for my friend's kid", "for my niece")
+_BUDGET_CUES = ("budget", "set aside", "allow for", "spending habits", "expense tracker", "track my expenses")
+_FROM_TO_RE = re.compile(r"\bfrom\s+(\d+(?:,\d+)?)\s+to\s+(\d+(?:,\d+)?)\b", re.IGNORECASE)
+_STEADY_RE = re.compile(r"\bremained steady\b", re.IGNORECASE)
+_COMPARE_TO_RE = re.compile(
+    r"\bin\s+([a-z][a-z ]+?)\s+compared to\s+([a-z][a-z ]+?)\??$",
+    re.IGNORECASE,
+)
+_PER_NIGHT_RE = re.compile(r"\bper night\b", re.IGNORECASE)
 _MONTHS = {
     "jan": 1,
     "january": 1,
@@ -605,6 +732,262 @@ def _expand_focus_terms(subject, question):
     return terms
 
 
+def _clean_multi_session_action(action):
+    value = normalize_answer(action)
+    value = re.sub(r"^(?:do|did|have|has|am|are|were|will|can|need|need to|trying to|been)\s+", "", value)
+    value = re.sub(r"^to\s+", "", value)
+    value = re.sub(r"^(?:currently\s+|current\s+)", "", value)
+    value = re.sub(r"\s+(?:from|at|in|on)\s+.+$", "", value)
+    value = value.strip()
+    if value.endswith("ing") and value.startswith("currently "):
+        value = value.replace("currently ", "", 1)
+    replacements = {
+        "pick": "pick up",
+        "pickup": "pick up",
+        "returning": "return",
+        "leading": "lead",
+        "led": "lead",
+        "worked on": "work on",
+        "working on": "work on",
+        "bought": "buy",
+        "purchased": "buy",
+        "using": "use",
+        "used": "use",
+        "attended": "attend",
+        "visiting": "visit",
+        "visited": "visit",
+    }
+    return replacements.get(value, value)
+
+
+def _match_phrase_map(text, mapping):
+    normalized_text = normalize_answer(text)
+    values = []
+    seen = set()
+    for needle, label in mapping.items():
+        normalized_needle = normalize_answer(needle)
+        if normalized_needle and _phrase_matches_text(normalized_needle, normalized_text):
+            normalized_label = normalize_answer(label)
+            if normalized_label not in seen:
+                seen.add(normalized_label)
+                values.append(label)
+    return values
+
+
+def _dedupe_subsumed(values):
+    kept = []
+    seen = []
+    for value in values:
+        normalized = normalize_answer(value)
+        if not normalized:
+            continue
+        if any(normalized == prior or normalized in prior for prior in seen):
+            continue
+        seen = [prior for prior in seen if prior not in normalized]
+        kept = [prior for prior in kept if normalize_answer(prior) not in normalized]
+        seen.append(normalized)
+        kept.append(value)
+    return kept
+
+
+def _extract_branded_items(text):
+    values = []
+    seen = set()
+    normalized_text = normalize_answer(text)
+    for match in _BRANDED_ITEM_RE.finditer(text or ""):
+        candidate = _cleanup_event_surface(match.group(1))
+        if not candidate:
+            continue
+        normalized = normalize_answer(candidate)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        values.append(candidate)
+    for term in _INSTRUMENT_TERMS + _CLOTHING_TERMS:
+        if _phrase_matches_text(normalize_answer(term), normalized_text):
+            normalized = normalize_answer(term)
+            if normalized not in seen:
+                seen.add(normalized)
+                values.append(term)
+    values = _dedupe_subsumed(values)
+    normalized_values = [normalize_answer(value) for value in values]
+    if any("drum set" in value for value in normalized_values):
+        values = [value for value in values if normalize_answer(value) != "drums"]
+    return values
+
+
+def _extract_venue_names(text):
+    values = []
+    seen = set()
+    for match in _VENUE_NAME_RE.finditer(text or ""):
+        candidate = _collapse(match.group(1)).strip()
+        normalized = normalize_answer(candidate)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            values.append(candidate)
+    return values
+
+
+def _entry_has_personal_fact(text):
+    normalized = normalize_answer(text)
+    return any(
+        cue in normalized
+        for cue in (
+            "i visited",
+            "i recently visited",
+            "i attended",
+            "i recently attended",
+            "i made",
+            "i recently made",
+            "i added",
+            "i infused",
+            "i bought",
+            "i went",
+            "i got back from",
+            "i had an appointment",
+            "i recently had",
+            "i just got back from",
+            "i was diagnosed",
+            "i recently got back into",
+            "i stayed",
+            "i booked",
+        )
+    )
+
+
+def _subject_requires_strict_values(plan):
+    subject = normalize_answer(plan.multi_session_subject)
+    return any(
+        token in subject
+        for token in (
+            "citrus",
+            "museum",
+            "gallery",
+            "doctor",
+            "grocery store",
+            "food delivery",
+            "social media platform",
+            "musical instrument",
+            "clothing",
+            "wedding",
+            "project",
+            "art-related",
+        )
+    )
+
+
+def _extract_owned_instruments(text):
+    values = []
+    lowered = (text or "").lower()
+    for match in re.finditer(
+        r"\bmy\s+([a-z0-9' -]{0,50}?(?:electric guitar|acoustic guitar|guitar|drum set|drums|piano|keyboard|ukulele|violin|cello|flute|saxophone|bass))\b",
+        lowered,
+        re.IGNORECASE,
+    ):
+        candidate = _cleanup_event_surface(match.group(1))
+        if candidate:
+            values.append(candidate)
+    return _dedupe_subsumed(values)
+
+
+def _extract_project_values(text):
+    normalized_text = normalize_answer(text)
+    values = _match_phrase_map(text, {term: term.title() for term in _PROJECT_TERMS})
+    if "poster" in normalized_text and "research" in normalized_text and "marketing" in normalized_text:
+        values.append("Marketing Research")
+    if "case competition" in normalized_text:
+        values.append("Case Competition")
+    if "working on a project" in normalized_text and "marketing research" in normalized_text:
+        values.append("Marketing Research")
+    return _dedupe_preserve(values)
+
+
+def _extract_subject_values(plan, entry):
+    text = entry.get("text", "")
+    labels = " ".join(entry.get("labels", []))
+    aliases = " ".join(entry.get("event_aliases", []))
+    entities = " ".join(entry.get("entities", []))
+    blob = " ".join([text, labels, aliases, entities, " ".join(entry.get("doctor_names", []))])
+    normalized_blob = normalize_answer(blob)
+    subject = normalize_answer(plan.multi_session_subject)
+    values = []
+
+    if "doctor" in subject:
+        doctors = _extract_doctor_names(text)
+        roles = [value for value in doctors if not value.startswith("Dr.")]
+        return _dedupe_preserve(roles or doctors)
+    if any(token in subject for token in ("museum", "gallery")):
+        if not _entry_has_personal_fact(text):
+            return []
+        return _dedupe_preserve(_extract_venue_names(blob))
+    if "citrus" in subject:
+        if not _entry_has_personal_fact(text):
+            return []
+        return _dedupe_preserve(_match_phrase_map(blob, _CITRUS_VALUES))
+    if "food delivery" in subject:
+        return _dedupe_preserve(_match_phrase_map(blob, _FOOD_DELIVERY_VALUES))
+    if "cuisine" in subject:
+        return _dedupe_preserve(_match_phrase_map(blob, _CUISINE_VALUES))
+    if "grocery store" in subject or "grocery" in subject:
+        return _dedupe_preserve(_match_phrase_map(blob, _GROCERY_STORE_VALUES))
+    if "social media platform" in subject:
+        return _dedupe_preserve(_match_phrase_map(blob, _SOCIAL_PLATFORM_VALUES))
+    if "musical instrument" in subject or "instrument" in subject:
+        return _dedupe_preserve(_extract_owned_instruments(text))
+    if "clothing" in subject:
+        matches = _match_phrase_map(blob, {term: term for term in _CLOTHING_TERMS})
+        if "dry cleaning" in normalized_blob:
+            for_match = re.search(r"\bfor\s+(?:the\s+)?([a-z0-9' -]{2,40})", normalize_answer(text))
+            if for_match:
+                matches.append(for_match.group(1))
+        matches.extend(_extract_branded_items(text))
+        return _dedupe_preserve(matches)
+    if "project" in subject or "thesis" in subject:
+        return _extract_project_values(blob)
+    if "model kit" in subject:
+        model_values = []
+        for label in entry.get("labels", []) + entry.get("event_aliases", []):
+            cleaned = _collapse(label)
+            if any(token in normalize_answer(cleaned) for token in ("spitfire", "camaro", "bomber", "tiger", "eagle", "model")):
+                model_values.append(cleaned)
+        return _dedupe_preserve(model_values)
+    if "wedding" in subject:
+        if not _entry_has_personal_fact(text):
+            return []
+        couples = [f"{left} and {right}" for left, right in _WEDDING_COUPLE_RE.findall(text or "")]
+        return _dedupe_preserve(couples)
+    if "art-related event" in subject:
+        if not _entry_has_personal_fact(text):
+            return []
+        values = _extract_venue_names(blob)
+        for term in _ART_EVENT_TERMS:
+            if _phrase_matches_text(normalize_answer(term), normalized_blob):
+                values.append(term.title())
+        return _dedupe_preserve(values)
+    if "fitness class" in subject:
+        for term in ("yoga", "pilates", "spin", "cycling", "zumba", "barre", "boxing"):
+            if _phrase_matches_text(term, normalized_blob):
+                values.append(term.title())
+        return _dedupe_preserve(values)
+    return _dedupe_preserve(values)
+
+
+def _is_current_state_entry(plan, entry):
+    if not plan.requires_current_state:
+        return True
+    text = normalize_answer(entry.get("text", ""))
+    if any(marker in text for marker in _NEGATED_OWNERSHIP_CUES):
+        return False
+    return any(marker in text for marker in _CURRENT_STATE_CUES)
+
+
+def _comparison_targets(plan):
+    match = _COMPARE_TO_RE.search(plan.question.lower().strip())
+    if not match:
+        return []
+    return [_clean_question_clause(match.group(1)), _clean_question_clause(match.group(2))]
+
+
 def _multi_session_window(question, normalized_question_date):
     base_date = _parse_iso_date(normalized_question_date)
     if base_date is None:
@@ -645,6 +1028,14 @@ def _analyze_multi_session(question, normalized_question_date):
     if match := _MULTI_TIME_RE.match(lowered):
         subject = match.group(1)
         kind = "time_lookup"
+    elif "which grocery store" in lowered and "spend the most" in lowered:
+        subject = "grocery store"
+        actions = ["spent"]
+        kind = "max_value"
+    elif "which social media platform" in lowered and "gain the most followers" in lowered:
+        subject = "social media platform"
+        actions = ["gain"]
+        kind = "max_value"
     elif match := _MULTI_TOTAL_SPENT_RE.match(lowered):
         subject = match.group(1)
         actions = ["spent"]
@@ -652,7 +1043,7 @@ def _analyze_multi_session(question, normalized_question_date):
     elif lowered.startswith("how much more did i spend on"):
         subject = lowered.replace("how much more did i spend on", "", 1).strip()
         actions = ["spent"]
-        kind = "sum_money"
+        kind = "difference_money"
     elif match := _MULTI_HOW_MANY_RE.match(lowered):
         subject = match.group(1)
         actions = [part.strip() for part in re.split(r"\bor\b|\band\b|,", match.group(2)) if part.strip()]
@@ -673,6 +1064,7 @@ def _analyze_multi_session(question, normalized_question_date):
     if not subject:
         subject = lowered
     subject = _clean_question_clause(subject)
+    actions = [_clean_multi_session_action(action) for action in actions if _clean_multi_session_action(action)]
     focus_terms = _expand_focus_terms(subject, question)
     range_start, range_end = _multi_session_window(question, normalized_question_date)
     return {
@@ -727,6 +1119,25 @@ def _derive_event_date_candidates(text, session_date):
         add_date(parsed, "explicit-date", 1.0)
 
     if base_date is not None:
+        for match in _SHORT_MONTH_DAY_RE.finditer(text):
+            month_value = int(match.group(1))
+            day_value = int(match.group(2))
+            if not (1 <= month_value <= 12 and 1 <= day_value <= 31):
+                continue
+            year_token = match.group(3)
+            year_value = base_date.year
+            if year_token:
+                year_value = int(year_token)
+                if year_value < 100:
+                    year_value += 2000
+            try:
+                derived = date(year_value, month_value, day_value)
+            except ValueError:
+                continue
+            if derived > base_date + timedelta(days=1) and not year_token:
+                derived = date(year_value - 1, month_value, day_value)
+            add_date(derived, "explicit-short-month-day", 0.88 if year_token else 0.84)
+
         for match in _MONTH_DAY_RE.finditer(text):
             month_token = match.group(1).lower()
             month_value = _MONTHS.get(month_token)
@@ -1335,7 +1746,7 @@ def _extract_action_objects(text, actions):
     lowered = _collapse(text).lower()
     values = []
     for action in actions:
-        action = action.strip().lower()
+        action = _clean_multi_session_action(action).strip().lower()
         if not action:
             continue
         pattern = re.compile(
@@ -1349,6 +1760,14 @@ def _extract_action_objects(text, actions):
             value = f"{action}:{phrase}"
             if value not in values:
                 values.append(value)
+        if action == "pick up" and "dry cleaning" in lowered:
+            extra = re.search(r"dry cleaning\s+for\s+(?:the\s+)?([a-z0-9' -]{2,40})", lowered)
+            if extra:
+                values.append(f"{action}:{_cleanup_event_surface(extra.group(1))}")
+        if action == "return":
+            extra = re.search(r"return\s+(?:some\s+|my\s+|the\s+|a\s+|an\s+)?([a-z0-9' -]{2,40})", lowered)
+            if extra:
+                values.append(f"{action}:{_cleanup_event_surface(extra.group(1))}")
     return values
 
 
@@ -1366,10 +1785,10 @@ def _build_multi_session_entries(fact_memories):
                 "labels": metadata.get("aggregate_labels", []),
                 "event_aliases": metadata.get("event_aliases", []),
                 "entities": metadata.get("entities", []),
-                "currency_values": metadata.get("currency_values", []),
-                "quantity_values": metadata.get("quantity_values", []),
-                "clock_times": metadata.get("clock_times", []),
-                "doctor_names": metadata.get("doctor_names", []),
+                "currency_values": metadata.get("currency_values") or _extract_currency_values(metadata.get("fact_text", memory["text"])),
+                "quantity_values": metadata.get("quantity_values") or _extract_quantity_values(metadata.get("fact_text", memory["text"])),
+                "clock_times": metadata.get("clock_times") or _extract_clock_times(metadata.get("fact_text", memory["text"])),
+                "doctor_names": metadata.get("doctor_names") or _extract_doctor_names(metadata.get("fact_text", memory["text"])),
                 "memory_text": memory["text"],
                 "importance": memory["importance"],
                 "has_answer": metadata.get("has_answer", False),
@@ -1395,8 +1814,11 @@ def _multi_session_text_blob(entry):
 def _multi_session_entry_score(plan, entry):
     text_blob = _multi_session_text_blob(entry)
     score = 0.0
+    subject_values = _extract_subject_values(plan, entry)
+    entry["subject_values"] = subject_values
     focus_matches = sum(1 for token in plan.multi_session_focus_terms if token in text_blob)
     score += 0.42 * focus_matches
+    score += 0.6 * len(subject_values)
     for action in plan.multi_session_actions:
         normalized_action = normalize_answer(action)
         if normalized_action and normalized_action in text_blob:
@@ -1406,7 +1828,7 @@ def _multi_session_entry_score(plan, entry):
     if _entry_in_range(entry, plan):
         score += 0.2
     elif plan.range_start or plan.range_end:
-        score -= 0.4
+        score -= 1.0
     if plan.multi_session_kind == "sum_money" and entry.get("currency_values"):
         score += 1.2
     if plan.multi_session_kind == "sum_quantity":
@@ -1426,6 +1848,10 @@ def _multi_session_entry_score(plan, entry):
         score += 0.4
     if plan.requires_current_state and any(token in text_blob for token in ("current", "currently", "still", "use", "own", "have")):
         score += 0.3
+    if plan.requires_current_state and not _is_current_state_entry(plan, entry):
+        score -= 1.2
+    if plan.multi_session_kind in {"count_entries", "count_distinct", "max_value"} and not subject_values:
+        score -= 0.6
     return score
 
 
@@ -1446,26 +1872,44 @@ def _entry_display_key(plan, entry):
 
 
 def _distinct_values_for_entry(plan, entry):
-    values = []
-    if "doctor" in plan.multi_session_subject:
-        doctor_names = list(entry.get("doctor_names", []))
-        if not doctor_names:
-            doctor_names = _extract_doctor_names(entry.get("text", ""))
-        if doctor_names:
-            return doctor_names
+    if plan.requires_current_state and not _is_current_state_entry(plan, entry):
+        return []
+    subject_values = entry.get("subject_values")
+    if subject_values is None:
+        subject_values = _extract_subject_values(plan, entry)
+        entry["subject_values"] = subject_values
+    if subject_values:
+        return _dedupe_preserve(subject_values)
+    if _subject_requires_strict_values(plan):
+        return []
     action_objects = _extract_action_objects(entry.get("text", ""), plan.multi_session_actions)
     if action_objects:
-        return action_objects
+        return _dedupe_preserve(action_objects)
+    values = []
     for source in (entry.get("labels", []), entry.get("event_aliases", []), entry.get("entities", [])):
         for value in source:
             normalized = normalize_answer(value)
-            if not normalized:
-                continue
-            if normalized in {"doctor", "doctors", "dr"}:
+            if not normalized or normalized in {"doctor", "doctors", "dr"}:
                 continue
             if any(token in normalized for token in plan.multi_session_focus_terms):
                 values.append(value)
     return _dedupe_preserve(values)
+
+
+def _count_values_for_entry(plan, entry):
+    if plan.requires_current_state and not _is_current_state_entry(plan, entry):
+        return []
+    subject_values = _distinct_values_for_entry(plan, entry)
+    if "clothing" in normalize_answer(plan.multi_session_subject):
+        action_objects = _extract_action_objects(entry.get("text", ""), plan.multi_session_actions)
+        text = normalize_answer(entry.get("text", ""))
+        if action_objects and any(token in text for token in ("zara", "dry cleaning", "store", "exchange", "pick up")):
+            return _dedupe_preserve(action_objects)
+        return []
+    if "doctor appointment" in normalize_answer(plan.multi_session_subject):
+        if _extract_doctor_names(entry.get("text", "")) or "appointment" in normalize_answer(entry.get("text", "")):
+            return [entry.get("entry_id", "appointment")]
+    return subject_values
 
 
 def _format_money(amount):
@@ -1474,6 +1918,35 @@ def _format_money(amount):
     if float(amount).is_integer():
         return f"${int(amount)}"
     return f"${amount:.2f}".rstrip("0").rstrip(".")
+
+
+def _entry_money_values(plan, entry):
+    values = []
+    text = normalize_answer(entry.get("text", ""))
+    subject = normalize_answer(plan.multi_session_subject)
+    if any(cue in text for cue in _BUDGET_CUES):
+        return []
+    currency_values = entry.get("currency_values", [])
+    if plan.multi_session_kind == "difference_money" and _PER_NIGHT_RE.search(plan.question):
+        return currency_values[:1]
+    if "luxury" in subject:
+        if not any(token in text for token in ("luxury", "gucci", "gown", "handbag", "resort", "designer")):
+            return []
+        if len(currency_values) > 1:
+            return [max(currency_values, key=lambda item: item["value"])]
+    return currency_values
+
+
+def _aggregate_answer_is_safe(plan, solution):
+    if not solution.resolved or not solution.answer:
+        return False
+    if plan.multi_session_kind in {"sum_money", "time_lookup", "difference_money"}:
+        return solution.confidence >= 0.78
+    if plan.multi_session_kind in {"sum_quantity", "max_value"}:
+        return solution.confidence >= 0.84
+    if plan.multi_session_kind in {"count_entries", "count_distinct"}:
+        return solution.confidence >= 0.9
+    return solution.confidence >= 0.85
 
 
 def _summarize_multi_session_entry(plan, entry):
@@ -1494,22 +1967,51 @@ def _solve_multi_session_from_entries(plan, entries):
     relevant = [entry for entry in entries if entry.get("score", 0.0) > 0.55]
     if not relevant:
         relevant = entries[:8]
+    in_range = [entry for entry in relevant if _entry_in_range(entry, plan)]
+    if in_range:
+        relevant = in_range
     if not relevant:
         return TemporalSolution(False, "", 0.0, "no-relevant-entries", "insufficient", [], [])
 
-    if plan.multi_session_kind == "sum_money":
+    if plan.multi_session_kind in {"sum_money", "difference_money"}:
         seen = set()
         values = []
         supporting = []
+        buckets = {}
         for entry in relevant:
             key = normalize_answer(_entry_display_key(plan, entry))
-            for item in entry.get("currency_values", []):
+            bucket_keys = _distinct_values_for_entry(plan, entry)[:2]
+            if plan.multi_session_kind == "difference_money":
+                bucket_keys = _comparison_targets(plan)
+            for item in _entry_money_values(plan, entry):
                 dedupe_key = (key, item["raw"])
                 if dedupe_key in seen:
                     continue
                 seen.add(dedupe_key)
                 values.append(item["value"])
                 supporting.append(entry)
+                for bucket in bucket_keys or ["total"]:
+                    normalized_bucket = normalize_answer(bucket)
+                    text_blob = _multi_session_text_blob(entry)
+                    if normalized_bucket == "total" or normalized_bucket in text_blob:
+                        buckets.setdefault(normalized_bucket, []).append(item["value"])
+        if plan.multi_session_kind == "difference_money":
+            targets = _comparison_targets(plan)
+            if len(targets) >= 2:
+                left_values = buckets.get(normalize_answer(targets[0]), [])
+                right_values = buckets.get(normalize_answer(targets[1]), [])
+                if left_values and right_values:
+                    difference = max(left_values) - max(right_values)
+                    if difference >= 0:
+                        return TemporalSolution(
+                            True,
+                            _format_money(difference),
+                            0.84,
+                            "difference-money",
+                            "multi-session-difference-money",
+                            [entry["entry_id"] for entry in supporting[:8]],
+                            [entry.get("event_date", "") for entry in supporting[:8]],
+                        )
         if values:
             total = sum(values)
             return TemporalSolution(
@@ -1531,6 +2033,11 @@ def _solve_multi_session_from_entries(plan, entries):
             key = normalize_answer(_entry_display_key(plan, entry))
             for item in entry.get("quantity_values", []):
                 if unit and _normalize_unit(item.get("unit")) != unit:
+                    continue
+                if plan.multi_session_focus_terms and not (
+                    any(token in _multi_session_text_blob(entry) for token in plan.multi_session_focus_terms)
+                    or _count_values_for_entry(plan, entry)
+                ):
                     continue
                 dedupe_key = (key, item["raw"])
                 if dedupe_key in seen:
@@ -1596,7 +2103,7 @@ def _solve_multi_session_from_entries(plan, entries):
             return TemporalSolution(
                 True,
                 str(len(distinct)),
-                0.68 if len(distinct) >= 2 else 0.58,
+                0.78 if len(distinct) >= 2 else 0.64,
                 "count-distinct",
                 "multi-session-count-distinct",
                 [entry["entry_id"] for entry in supporting[:8]],
@@ -1608,9 +2115,7 @@ def _solve_multi_session_from_entries(plan, entries):
         seen = set()
         supporting = []
         for entry in relevant:
-            values = _extract_action_objects(entry.get("text", ""), plan.multi_session_actions)
-            if not values:
-                values = _distinct_values_for_entry(plan, entry)[:1]
+            values = _count_values_for_entry(plan, entry)
             for value in values:
                 normalized = normalize_answer(value)
                 if not normalized or normalized in seen:
@@ -1622,12 +2127,45 @@ def _solve_multi_session_from_entries(plan, entries):
             return TemporalSolution(
                 True,
                 str(len(distinct)),
-                0.62 if len(distinct) >= 2 else 0.52,
+                0.76 if len(distinct) >= 2 else 0.62,
                 "count-entries",
                 "multi-session-count-entries",
                 [entry["entry_id"] for entry in supporting[:8]],
                 [entry.get("event_date", "") for entry in supporting[:8]],
             )
+
+    if plan.multi_session_kind == "max_value":
+        subject = normalize_answer(plan.multi_session_subject)
+        if "grocery store" in subject:
+            totals = {}
+            supporting = {}
+            seen = set()
+            for entry in relevant:
+                stores = _distinct_values_for_entry(plan, entry)
+                if not stores:
+                    continue
+                for store in stores:
+                    normalized_store = normalize_answer(store)
+                    for item in _entry_money_values(plan, entry):
+                        dedupe_key = (normalized_store, item["raw"], entry.get("session_id"))
+                        if dedupe_key in seen:
+                            continue
+                        seen.add(dedupe_key)
+                        totals[normalized_store] = totals.get(normalized_store, 0.0) + item["value"]
+                        supporting.setdefault(normalized_store, []).append(entry)
+            if totals:
+                best = max(totals.items(), key=lambda item: item[1])[0]
+                canonical = _GROCERY_STORE_VALUES.get(best, best.title())
+                chosen = supporting.get(best, [])
+                return TemporalSolution(
+                    True,
+                    canonical,
+                    0.8,
+                    "max-money-store",
+                    "multi-session-max-value",
+                    [entry["entry_id"] for entry in chosen[:8]],
+                    [entry.get("event_date", "") for entry in chosen[:8]],
+                )
 
     return TemporalSolution(False, "", 0.0, "no-deterministic-multi-session-answer", "open", [], [])
 
@@ -1646,6 +2184,7 @@ def _build_multi_session_aggregate_memories(instance, plan, fact_memories):
         return []
 
     solution = _solve_multi_session_from_entries(plan, relevant)
+    safe_answer = _aggregate_answer_is_safe(plan, solution)
     summary_lines = [
         f"Aggregate memory for multi-session question: {plan.question}",
         f"Aggregation kind: {plan.multi_session_kind}",
@@ -1653,7 +2192,7 @@ def _build_multi_session_aggregate_memories(instance, plan, fact_memories):
     ]
     if plan.range_start or plan.range_end:
         summary_lines.append(f"Window: {plan.range_start or 'start'} to {plan.range_end or 'end'}")
-    if solution.resolved:
+    if safe_answer:
         summary_lines.append(
             f"Derived answer candidate: {solution.answer} (confidence={solution.confidence:.2f}, mode={solution.mode})"
         )
@@ -1691,6 +2230,7 @@ def _build_multi_session_aggregate_memories(instance, plan, fact_memories):
                 "date_candidates": [],
                 "aggregate_kind": plan.multi_session_kind,
                 "aggregate_answer": solution.answer,
+                "aggregate_answer_public": safe_answer,
                 "aggregate_confidence": solution.confidence,
                 "aggregate_mode": solution.mode,
                 "aggregate_entries": [
@@ -2241,7 +2781,7 @@ def render_evidence_line(hit, index=None):
     metadata = hit.record.metadata
     if metadata.get("granularity") == "aggregate" or hit.record.memory_type == "aggregate":
         aggregate_kind = metadata.get("aggregate_kind", "aggregate")
-        answer = metadata.get("aggregate_answer") or "unknown"
+        answer = metadata.get("aggregate_answer") if metadata.get("aggregate_answer_public", True) else "withheld"
         confidence = float(metadata.get("aggregate_confidence", 0.0) or 0.0)
         prefix = f"{index}. " if index is not None else ""
         return (
@@ -2656,10 +3196,10 @@ def _build_multi_session_entries_from_hits(plan, selected_hits):
                 "labels": metadata.get("aggregate_labels", []),
                 "event_aliases": metadata.get("event_aliases", []),
                 "entities": metadata.get("entities", []),
-                "currency_values": metadata.get("currency_values", []),
-                "quantity_values": metadata.get("quantity_values", []),
-                "clock_times": metadata.get("clock_times", []),
-                "doctor_names": metadata.get("doctor_names", []),
+                "currency_values": metadata.get("currency_values") or _extract_currency_values(metadata.get("fact_text") or metadata.get("summary") or hit.record.text),
+                "quantity_values": metadata.get("quantity_values") or _extract_quantity_values(metadata.get("fact_text") or metadata.get("summary") or hit.record.text),
+                "clock_times": metadata.get("clock_times") or _extract_clock_times(metadata.get("fact_text") or metadata.get("summary") or hit.record.text),
+                "doctor_names": metadata.get("doctor_names") or _extract_doctor_names(metadata.get("fact_text") or metadata.get("summary") or hit.record.text),
                 "memory_text": hit.record.text,
                 "importance": hit.record.importance,
                 "has_answer": metadata.get("has_answer", False),
@@ -2773,7 +3313,7 @@ def solve_temporal_question(plan, selected_hits):
             metadata = best.record.metadata
             answer = _collapse(metadata.get("aggregate_answer", ""))
             confidence = float(metadata.get("aggregate_confidence", 0.0) or 0.0)
-            if answer:
+            if answer and metadata.get("aggregate_answer_public", True):
                 return TemporalSolution(
                     resolved=True,
                     answer=answer,

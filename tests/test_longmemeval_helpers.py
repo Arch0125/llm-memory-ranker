@@ -734,6 +734,95 @@ class LongMemEvalHelpersTest(unittest.TestCase):
         self.assertTrue(result.resolved)
         self.assertEqual(result.answer, "2")
 
+    def test_solve_temporal_question_multi_session_counts_citrus_distinctly(self):
+        instance = {
+            "question_id": "q-ms-citrus",
+            "question_type": "multi-session",
+            "question": "How many different types of citrus fruits have I used in my cocktail recipes?",
+            "answer": "3",
+            "question_date": "2024/05/30 (Thu) 09:00",
+            "haystack_session_ids": [],
+            "haystack_dates": [],
+            "haystack_sessions": [],
+            "answer_session_ids": [],
+        }
+        plan = analyze_question(instance)
+        hits = [
+            make_hit("s1", text="2024-05-21 | I made orange bitters using orange peels and vodka.", entities=["orange bitters"]),
+            make_hit("s2", text="2024-05-25 | I recently made a cucumber gimlet with lime juice.", entities=["cucumber gimlet"]),
+            make_hit("s3", text="2024-05-26 | I added lemon juice to my summer spritz.", entities=["summer spritz"]),
+        ]
+        result = solve_temporal_question(plan, hits)
+        self.assertTrue(result.resolved)
+        self.assertEqual(result.answer, "3")
+
+    def test_solve_temporal_question_multi_session_computes_money_difference(self):
+        instance = {
+            "question_id": "q-ms-diff-money",
+            "question_type": "multi-session",
+            "question": "How much more did I spend on accommodations per night in Hawaii compared to Tokyo?",
+            "answer": "$270",
+            "question_date": "2024/05/30 (Thu) 09:00",
+            "haystack_session_ids": [],
+            "haystack_dates": [],
+            "haystack_sessions": [],
+            "answer_session_ids": [],
+        }
+        plan = analyze_question(instance)
+        hits = [
+            make_hit("s1", text="2024-05-22 | I booked a resort in Maui for $300 per night.", entities=["maui", "hawaii"]),
+            make_hit("s2", text="2024-05-24 | I stayed in a hostel in Tokyo that cost around $30 per night.", entities=["tokyo"]),
+        ]
+        result = solve_temporal_question(plan, hits)
+        self.assertTrue(result.resolved)
+        self.assertEqual(result.answer, "$270")
+
+    def test_solve_temporal_question_multi_session_finds_max_grocery_store(self):
+        instance = {
+            "question_id": "q-ms-grocery-max",
+            "question_type": "multi-session",
+            "question": "Which grocery store did I spend the most money at in the past month?",
+            "answer": "Thrive Market",
+            "question_date": "2024/05/30 (Thu) 09:00",
+            "haystack_session_ids": [],
+            "haystack_dates": [],
+            "haystack_sessions": [],
+            "answer_session_ids": [],
+        }
+        plan = analyze_question(instance)
+        hits = [
+            make_hit("s1", text="2024-05-16 | I went grocery shopping at Walmart and spent $120.", entities=["walmart"]),
+            make_hit("s2", text="2024-05-21 | I shopped at Trader Joe's and spent $80.", entities=["trader joe's"]),
+            make_hit("s3", text="2024-05-18 | I bought groceries on Thrive Market for $150.", entities=["thrive market"]),
+        ]
+        result = solve_temporal_question(plan, hits)
+        self.assertTrue(result.resolved)
+        self.assertEqual(result.answer, "Thrive Market")
+
+    def test_solve_temporal_question_multi_session_counts_current_instruments(self):
+        instance = {
+            "question_id": "q-ms-instruments",
+            "question_type": "multi-session",
+            "question": "How many musical instruments do I currently own?",
+            "answer": "4",
+            "question_date": "2024/05/30 (Thu) 09:00",
+            "haystack_session_ids": [],
+            "haystack_dates": [],
+            "haystack_sessions": [],
+            "answer_session_ids": [],
+        }
+        plan = analyze_question(instance)
+        hits = [
+            make_hit("s1", text="2024-05-04 | I've had my black Fender Stratocaster electric guitar for 5 years.", entities=["fender stratocaster"]),
+            make_hit("s2", text="2024-05-22 | I've had my acoustic guitar, a Yamaha FG800, for about 8 years.", entities=["yamaha fg800"]),
+            make_hit("s3", text="2024-05-21 | My piano, a Korg B1, needs maintenance.", entities=["korg b1"]),
+            make_hit("s4", text="2024-05-21 | I'm thinking of selling my old drum set, a 5-piece Pearl Export.", entities=["pearl export"]),
+            make_hit("s5", text="2024-04-21 | My niece just got a new student-level violin from a store.", entities=["violin"]),
+        ]
+        result = solve_temporal_question(plan, hits)
+        self.assertTrue(result.resolved)
+        self.assertEqual(result.answer, "4")
+
     def test_summarize_records(self):
         summary = summarize_records(
             [
