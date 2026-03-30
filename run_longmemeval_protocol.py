@@ -18,6 +18,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+from benchmarks.argv_overrides import apply_argv_overrides
+from benchmarks.question_type_filters import normalize_question_types, question_type_slug
+
 
 data_dir = "data"
 reports_dir = "reports/longmemeval_protocol"
@@ -31,12 +34,15 @@ history_granularity = "hybrid"
 official_repo_path = ""
 official_eval_model = "gpt-4o"
 run_conditions = "s_full_history,s_memory,oracle_upper_bound"
-exec(open("configurator.py").read())  # overrides from command line or config file
+question_types = ""
+apply_argv_overrides(globals())
+question_types = normalize_question_types(question_types)
 
 
 ROOT = Path(__file__).resolve().parent
 RUNNER = ROOT / "benchmark_longmemeval_openai.py"
 RETRIEVAL_RUNNER = ROOT / "benchmark_longmemeval_retrieval.py"
+QUESTION_TYPE_SUFFIX = question_type_slug(question_types)
 
 
 def _dataset_path(name):
@@ -44,6 +50,13 @@ def _dataset_path(name):
 
 
 def _reports_path(name):
+    if not name:
+        return (ROOT / reports_dir).resolve()
+    if QUESTION_TYPE_SUFFIX:
+        path = Path(name)
+        suffixes = "".join(path.suffixes)
+        stem = path.name[: -len(suffixes)] if suffixes else path.name
+        name = f"{stem}__{QUESTION_TYPE_SUFFIX}{suffixes}"
     return (ROOT / reports_dir / name).resolve()
 
 
@@ -86,6 +99,8 @@ def _run_condition(label, dataset_path, memory_enabled, reader_context_mode):
     ]
     if max_examples > 0:
         args.append(f"--max_examples={max_examples}")
+    if question_types:
+        args.append(f"--question_types={question_types}")
 
     cmd = _run_python(args, cwd=str(ROOT))
     return {
@@ -112,6 +127,8 @@ def _run_retrieval_condition(label, dataset_path, granularity):
     ]
     if max_examples > 0:
         args.append(f"--max_examples={max_examples}")
+    if question_types:
+        args.append(f"--question_types={question_types}")
     cmd = _run_python(args, cwd=str(ROOT))
     return {
         "label": label,
@@ -246,6 +263,7 @@ condition_specs = {
 manifest = {
     "openai_model": openai_model,
     "official_eval_model": official_eval_model,
+    "question_types": question_types,
     "data_dir": str((ROOT / data_dir).resolve()),
     "reports_dir": str(reports_root),
     "conditions": [],

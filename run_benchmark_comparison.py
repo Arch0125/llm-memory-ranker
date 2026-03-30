@@ -7,6 +7,8 @@ Usage:
     ./venv/bin/python run_benchmark_comparison.py
     ./venv/bin/python run_benchmark_comparison.py --max_examples=50
     ./venv/bin/python run_benchmark_comparison.py --max_examples=100 --official_repo_path=/tmp/LongMemEval-official
+    ./venv/bin/python run_benchmark_comparison.py --max_examples=500 --official_repo_path=/tmp/LongMemEval-official --reuse_baseline=True
+    ./venv/bin/python run_benchmark_comparison.py --max_examples=500 --question_types=temporal,multisession
 
 Set OPENAI_API_KEY in your environment before running.
 """
@@ -17,6 +19,9 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+
+from benchmarks.argv_overrides import apply_argv_overrides
+from benchmarks.question_type_filters import normalize_question_types, question_type_slug
 
 
 # ── defaults (all overridable via --flag=value) ─────────────────────────────
@@ -29,13 +34,19 @@ official_eval_model = "gpt-4o"
 include_assistant_turns = False
 history_format = "nl"
 history_granularity = "hybrid"
-exec(open("configurator.py").read())  # overrides from CLI
+question_types = ""
+reuse_baseline = False
+reuse_memory = False
+parallel_workers = 8
+apply_argv_overrides(globals())
+question_types = normalize_question_types(question_types)
 # ─────────────────────────────────────────────────────────────────────────────
 
 ROOT = Path(__file__).resolve().parent
 RUNNER = ROOT / "benchmark_longmemeval_openai.py"
 REPORTS = ROOT / reports_dir
 REPORTS.mkdir(parents=True, exist_ok=True)
+QUESTION_TYPE_SUFFIX = question_type_slug(question_types)
 
 api_key = os.getenv("OPENAI_API_KEY", "")
 if not api_key:
@@ -43,11 +54,39 @@ if not api_key:
     sys.exit(1)
 
 
-def _run(label, memory_enabled, reader_context_mode):
-    """Run benchmark_longmemeval_openai.py for one condition."""
-    output   = str(REPORTS / f"{label}_predictions.jsonl")
-    details  = str(REPORTS / f"{label}_details.jsonl")
-    summary  = str(REPORTS / f"{label}_summary.json")
+def _report_name(name):
+    if not QUESTION_TYPE_SUFFIX:
+        return name
+    path = Path(name)
+    suffixes = "".join(path.suffixes)
+    stem = path.name[: -len(suffixes)] if suffixes else path.name
+    return f"{stem}__{QUESTION_TYPE_SUFFIX}{suffixes}"
+
+
+def _artifacts(label):
+    output = REPORTS / _report_name(f"{label}_predictions.jsonl")
+    details = REPORTS / _report_name(f"{label}_details.jsonl")
+    summary = REPORTS / _report_name(f"{label}_summary.json")
+    eval_results = REPORTS / _report_name(f"{label}_predictions.jsonl.eval-results-{official_eval_model}")
+    return output, details, summary, eval_results
+
+
+def _load_summary(summary_path):
+    with open(summary_path, "r") as f:
+        return json.load(f)
+
+
+def _run(label, memory_enabled, reader_context_mode, reuse_existing=False):
+    """Run benchmark_longmemeval_openai.py for one condition, or reuse prior outputs."""
+    output, details, summary, eval_results = _artifacts(label)
+
+    if reuse_existing and output.exists() and summary.exists():
+        print(f"\n{'='*70}")
+        print(f"  Reusing: {label}  ({max_examples} examples, model={openai_model})")
+        if question_types:
+            print(f"  Question types: {question_types}")
+        print(f"{'='*70}\n")
+        return _load_summary(summary), str(output), str(details), str(summary), eval_results.exists()
 
     cmd = [
         sys.executable, str(RUNNER),
@@ -62,30 +101,36 @@ def _run(label, memory_enabled, reader_context_mode):
         f"--include_assistant_turns={include_assistant_turns}",
         f"--history_format={history_format}",
         f"--history_granularity={history_granularity}",
+        f"--parallel_workers={parallel_workers}",
     ]
+    if question_types:
+        cmd.append(f"--question_types={question_types}")
     print(f"\n{'='*70}")
     print(f"  Running: {label}  ({max_examples} examples, model={openai_model})")
+    if question_types:
+        print(f"  Question types: {question_types}")
     print(f"{'='*70}\n")
     subprocess.run(cmd, check=True, cwd=str(ROOT))
 
-    with open(summary, "r") as f:
-        return json.load(f), output, details, summary
+    return _load_summary(summary), str(output), str(details), str(summary), False
 
 
-def _run_official_eval(prediction_path):
-    """Run the official LongMemEval evaluate_qa.py + print_qa_metrics.py."""
+def _run_official_eval(prediction_path, reuse_existing=False):
+    """Run or reuse the official LongMemEval evaluate_qa.py + print_qa_metrics.py."""
     repo = Path(official_repo_path).resolve()
     eval_script = list(repo.rglob("evaluate_qa.py"))[0]
     metrics_script = list(repo.rglob("print_qa_metrics.py"))[0]
     ds = str(Path(dataset_path).resolve())
     pred = str(Path(prediction_path).resolve())
-
-    # evaluate_qa.py  →  creates .eval-results-{model}
-    subprocess.run(
-        [sys.executable, str(eval_script), official_eval_model, pred, ds],
-        check=True, cwd=str(eval_script.parent),
-    )
     eval_results = pred + f".eval-results-{official_eval_model}"
+
+    if reuse_existing and Path(eval_results).exists():
+        print(f"Reusing official eval results for {Path(prediction_path).name}")
+    else:
+        subprocess.run(
+            [sys.executable, str(eval_script), official_eval_model, pred, ds],
+            check=True, cwd=str(eval_script.parent),
+        )
 
     # print_qa_metrics.py  →  stdout
     result = subprocess.run(
@@ -126,9 +171,12 @@ def _parse_official_metrics(output_text):
 def _print_table(baseline_metrics, memory_metrics, baseline_summary, memory_summary):
     """Print a markdown-style comparison table."""
     divider = "-" * 80
+    example_count = max(baseline_summary.get("examples", 0), memory_summary.get("examples", 0))
 
     print(f"\n\n{'='*80}")
-    print(f"  BENCHMARK COMPARISON  —  {max_examples} examples  —  model: {openai_model}")
+    print(f"  BENCHMARK COMPARISON  —  {example_count} examples  —  model: {openai_model}")
+    if question_types:
+        print(f"  Question types: {question_types}")
     print(f"{'='*80}\n")
 
     # Header
@@ -186,11 +234,11 @@ def _print_table(baseline_metrics, memory_metrics, baseline_summary, memory_summ
 
 
 # ── Run both conditions ─────────────────────────────────────────────────────
-baseline_summary, baseline_pred, _, _ = _run(
-    "cmp_baseline", memory_enabled=False, reader_context_mode="full-history",
+baseline_summary, baseline_pred, _, _, baseline_eval_exists = _run(
+    "cmp_baseline", memory_enabled=False, reader_context_mode="full-history", reuse_existing=reuse_baseline,
 )
-memory_summary, memory_pred, _, _ = _run(
-    "cmp_memory", memory_enabled=True, reader_context_mode="memory",
+memory_summary, memory_pred, _, _, memory_eval_exists = _run(
+    "cmp_memory", memory_enabled=True, reader_context_mode="memory", reuse_existing=reuse_memory,
 )
 
 # ── Official eval (if repo provided) ────────────────────────────────────────
@@ -199,8 +247,8 @@ if official_repo_path:
     print(f"  Running official GPT-4o evaluation on both conditions...")
     print(f"{'='*70}\n")
 
-    baseline_eval_output = _run_official_eval(baseline_pred)
-    memory_eval_output = _run_official_eval(memory_pred)
+    baseline_eval_output = _run_official_eval(baseline_pred, reuse_existing=reuse_baseline and baseline_eval_exists)
+    memory_eval_output = _run_official_eval(memory_pred, reuse_existing=reuse_memory and memory_eval_exists)
 
     print("\n── Baseline official eval ──")
     print(baseline_eval_output)

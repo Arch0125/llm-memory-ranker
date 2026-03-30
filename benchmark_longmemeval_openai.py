@@ -9,15 +9,21 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from benchmarks.argv_overrides import apply_argv_overrides
+from benchmarks.question_type_filters import normalize_question_types
 from benchmarks.longmemeval import (
     analyze_question,
     abstention_score,
     assess_answerability,
+    build_multi_session_checklist_context,
     build_history_context,
     build_benchmark_instructions,
     build_structured_event_view,
+    build_temporal_event_context,
     contains_match_score,
     exact_match_score,
     is_single_session_question,
@@ -52,7 +58,7 @@ question_types = ""
 history_granularity = "hybrid"
 include_assistant_turns = False
 include_question_date = True
-max_new_tokens = 96
+max_new_tokens = 128
 temperature = 0.0
 top_p = 1.0
 memory_enabled = True
@@ -80,7 +86,9 @@ openai_timeout_seconds = 120.0
 openai_max_retries = 5
 openai_reasoning_effort = ""
 openai_verbosity = ""
-exec(open("configurator.py").read())  # overrides from command line or config file
+parallel_workers = 8
+apply_argv_overrides(globals())
+question_types = normalize_question_types(question_types)
 # -----------------------------------------------------------------------------
 
 
@@ -113,40 +121,101 @@ def _build_baseline_instructions(plan, history_context="", base_system_prompt=No
     return "\n\n".join(parts)
 
 
-def _build_memory_session_instructions(plan, session_context="", evidence_sufficient=False, base_system_prompt=None, strict_abstention=False):
+def _build_memory_session_instructions(
+    plan,
+    session_context="",
+    evidence_sufficient=False,
+    base_system_prompt=None,
+    strict_abstention=False,
+    is_knowledge_update=False,
+    has_temporal_view=False,
+    has_session_checklist=False,
+    assistant_extraction=False,
+):
     parts = [base_system_prompt or DEFAULT_SYSTEM_PROMPT]
-    parts.append("Use the selected supporting session excerpts below to answer the question. Base your answer only on what is stated in those excerpts.")
+    parts.append("Use the selected supporting evidence below to answer the question. Base your answer only on what is stated there.")
+    if is_knowledge_update:
+        parts.append(
+            "IMPORTANT: The sessions are shown in chronological order. "
+            "If the same topic is discussed in multiple sessions, the LATER session contains the most up-to-date information. "
+            "Always prefer the value, number, or fact from the LATEST (most recent) session that discusses the topic."
+        )
+    if assistant_extraction:
+        parts.append(
+            "These excerpts include prior assistant answers. Extract only the exact field the user is asking for. "
+            "Do not paraphrase. Do not return the broader explanation if the question asks for a name, title, website, number, percentage, quote, or the 'other options'."
+        )
+    if has_temporal_view:
+        parts.append(
+            "If a structured event/date view is shown, use it first for calculations and ordering. "
+            "For ordering questions, include every relevant event in the final earliest-to-latest or latest-to-earliest order."
+        )
+    if has_session_checklist:
+        parts.append(
+            "If a session-by-session checklist is shown, process every checklist line before answering. "
+            "Do not stop after the first matching session."
+        )
     if session_context:
-        parts.append(f"Selected supporting session excerpts:\n{session_context.strip()}")
+        parts.append(f"Selected supporting evidence:\n{session_context.strip()}")
     if plan.is_multi_session:
-        parts.append("For multi-session questions, combine information across all the selected session excerpts.")
+        parts.append("For multi-session questions, combine information across ALL the selected session excerpts.")
         if plan.multi_session_kind in {"count_entries", "count_distinct"}:
-            parts.append("Carefully count EVERY relevant instance across ALL excerpts. List each one you find, then give the total count as a single number.")
+            subject = plan.multi_session_subject or "items"
+            parts.append(
+                f"You must count every distinct {subject} mentioned across ALL session excerpts. "
+                f"IMPORTANT: The answer is often spread across MANY sessions — each session may mention a different {subject}. "
+                f"Go through EVERY session one by one, extract the relevant {subject} from each, "
+                f"then count the unique ones. "
+                f"Your LAST line must be EXACTLY in this format: 'Final answer: <number>'"
+            )
         elif plan.multi_session_kind == "sum_money":
-            parts.append("Add up ALL relevant dollar amounts across ALL excerpts. Return only the final total like '$120'.")
+            parts.append(
+                "Add up ALL relevant dollar amounts across ALL excerpts. "
+                "Go through each session, find every relevant expense/amount, sum them all. "
+                "Show the math: $X + $Y + ... = $Z. "
+                "Your LAST line must be EXACTLY: 'Final answer: $<total>'"
+            )
         elif plan.multi_session_kind == "sum_quantity":
             unit = plan.unit_hint or "units"
-            parts.append(f"Add up ALL relevant quantities across ALL excerpts. Return only the final total like '12 {unit}'.")
+            parts.append(
+                f"Add up ALL relevant quantities across ALL excerpts. "
+                f"Go through each session, find every relevant quantity, sum them all. "
+                f"Show the math: X + Y + ... = Z. "
+                f"Your LAST line must be EXACTLY: 'Final answer: <number> {unit}'"
+            )
         else:
-            parts.append("Count or aggregate all relevant items mentioned.")
-        parts.append("Return only the final answer.")
+            parts.append("Combine and aggregate all relevant items mentioned across ALL excerpts.")
+        parts.append("Keep your answer short. Your final line must be 'Final answer: <value>'.")
     elif plan.reasoning_kind == "ordering":
-        parts.append("Return only the event or item that happened first or last.")
+        if "what is the order" in plan.question.lower() or "from earliest to latest" in plan.question.lower():
+            parts.append("Return the complete ordered list covering all relevant events, from earliest to latest unless the question says otherwise.")
+        else:
+            parts.append("Return only the event or item that happened first or last, based on the session dates shown.")
         if plan.targets:
             parts.append("Valid answer options: " + " | ".join(plan.targets))
     elif plan.reasoning_kind == "difference":
         unit = plan.unit_hint or "days"
-        parts.append(f"Return only the final duration like '7 {unit}'.")
+        parts.append(
+            f"Calculate the duration between the two events. Each session excerpt shows its date (e.g., 'Session on 2023-05-15'). "
+            f"Use those dates to compute the difference. Return only the final number like '7 {unit}'. "
+            f"Do NOT say 'Insufficient evidence' if you can see dates in the excerpts."
+        )
     elif plan.reasoning_kind == "date":
-        parts.append("Return only the final date or short date phrase.")
+        parts.append("Return only the final date or short date phrase. Look at the session date headers (e.g., 'Session on 2023-05-15') for date information.")
     else:
         parts.append("Return only the final answer, even if the evidence is partial. Prefer giving a best-effort answer over abstaining.")
     if strict_abstention:
         parts.append("If the question asks about something not clearly supported by the excerpts, respond with 'Insufficient evidence'. Be careful not to guess.")
     elif evidence_sufficient:
-        parts.append("The excerpts contain sufficient evidence. Answer directly from them. Do NOT reply with 'Insufficient evidence'.")
+        parts.append(
+            "The excerpts contain sufficient evidence. Answer directly from them. "
+            "Do NOT reply with 'Insufficient evidence'. You MUST provide an answer."
+        )
     else:
-        parts.append("Try to extract an answer from the excerpts. Only reply 'Insufficient evidence' if the excerpts contain absolutely no relevant information.")
+        parts.append(
+            "Try to extract an answer from the excerpts. Give your best answer even if the evidence is partial. "
+            "Only reply 'Insufficient evidence' if the excerpts contain absolutely no relevant information at all."
+        )
     return "\n\n".join(parts)
 
 
@@ -190,7 +259,7 @@ def _make_memory_system(store, embedder, policy):
 def _solver_allowed_reasoning_kind(plan):
     if plan.is_multi_session:
         return plan.multi_session_kind == "time_lookup"
-    return plan.reasoning_kind in {"ordering", "date"}
+    return plan.reasoning_kind in {"ordering", "date", "difference"}
 
 
 def _solver_can_prompt(plan, solver_result):
@@ -285,10 +354,13 @@ Path(details_path).parent.mkdir(parents=True, exist_ok=True)
 Path(summary_path).parent.mkdir(parents=True, exist_ok=True)
 
 embedder = build_embedder(memory_embedder)
-prediction_rows = []
-detail_rows = []
+# Lock for thread-safe access to the shared embedder (sentence-transformers
+# models are not guaranteed to be thread-safe).
+_embed_lock = threading.Lock()
 
-for index, instance in enumerate(instances, start=1):
+
+def _process_one(index, instance):
+    """Process a single LongMemEval example. Returns (index, prediction_row, detail_row)."""
     question_id = instance["question_id"]
     plan = analyze_question(instance, include_question_date=include_question_date)
     query_text = plan.query_text
@@ -309,17 +381,19 @@ for index, instance in enumerate(instances, start=1):
         }
 
         if resolved_context_mode == "memory":
-            _ingest_history(store, embedder, instance)
+            # Ingestion needs embedder — serialize embedding calls
+            _ingest_history_threadsafe(store, embedder, instance, _embed_lock)
             policy = _effective_policy(plan)
             memory_system = _make_memory_system(store, embedder, policy)
-            reranked = memory_system.rank_hits(query_text, hybrid=True)
+            with _embed_lock:
+                reranked = memory_system.rank_hits(query_text, hybrid=True)
 
-            # Query expansion for multi-session: run a second retrieval with
-            # the subject + action terms to catch memories the original query missed.
+            # Query expansion for multi-session
             if plan.is_multi_session and plan.multi_session_subject:
                 expanded_query = f"{plan.multi_session_subject} {' '.join(plan.multi_session_actions)}"
                 if expanded_query.strip() != query_text.strip():
-                    expanded_hits = memory_system.rank_hits(expanded_query, hybrid=True)
+                    with _embed_lock:
+                        expanded_hits = memory_system.rank_hits(expanded_query, hybrid=True)
                     seen_ids = {h.record.memory_id for h in reranked}
                     for eh in expanded_hits:
                         if eh.record.memory_id not in seen_ids:
@@ -331,11 +405,20 @@ for index, instance in enumerate(instances, start=1):
                 for hit in reranked
                 if hit.critic_label != "ignore" or hit.critic_confidence >= max(0.16, policy["maybe_threshold"] - 0.12)
             ]
-            if is_single_session_question(plan):
+            is_knowledge_update = (plan.question_type == "knowledge-update")
+            if is_single_session_question(plan) or plan.is_temporal or is_knowledge_update:
+                max_sess = 3
+                if plan.question_type == "single-session-assistant":
+                    max_sess = 2
+                if is_knowledge_update:
+                    max_sess = 3
+                if plan.is_temporal and plan.reasoning_kind in {"ordering", "difference"}:
+                    # Ordering/difference questions often need 2-3 specific sessions
+                    max_sess = 4
                 selected_hits, raw_session_ids = select_raw_session_hits(
                     plan,
                     candidate_hits,
-                    max_sessions=3,
+                    max_sessions=max_sess,
                 )
                 history_context = build_history_context(
                     instance,
@@ -353,11 +436,24 @@ for index, instance in enumerate(instances, start=1):
                     "distinct_sessions": list(raw_session_ids),
                     "covered_targets": [],
                 }
-                structured_events = []
-                solver_result = None
+                if plan.is_temporal:
+                    structured_events = build_structured_event_view(
+                        plan,
+                        selected_hits,
+                        limit=max(12, memory_structured_event_limit),
+                    )
+                    temporal_context = build_temporal_event_context(
+                        plan,
+                        selected_hits,
+                        limit=max(8, memory_structured_event_limit),
+                    )
+                    if temporal_context:
+                        history_context = f"{temporal_context}\n\n{history_context}".strip()
+                    solver_result = solve_temporal_question(plan, selected_hits)
+                else:
+                    structured_events = []
+                    solver_result = None
             elif plan.is_multi_session:
-                # --- Focus-term full-scan: find ALL sessions mentioning
-                #     the multi-session subject, not just top-k embedding hits ---
                 focus_terms = (
                     plan.multi_session_focus_terms
                     + plan.multi_session_actions
@@ -367,7 +463,6 @@ for index, instance in enumerate(instances, start=1):
                     focus_terms=focus_terms,
                     user_id=memory_user_id,
                 )
-                # Merge focus-scan hits into candidate_hits (de-duplicate)
                 seen_ids = {h.record.memory_id for h in candidate_hits}
                 for fh in focus_scan_hits:
                     if fh.record.memory_id not in seen_ids:
@@ -404,6 +499,13 @@ for index, instance in enumerate(instances, start=1):
                 }
                 structured_events = []
                 solver_result = solve_temporal_question(plan, session_hits) if session_hits else None
+                checklist_context = build_multi_session_checklist_context(
+                    plan,
+                    session_hits,
+                    limit=min(12, len(raw_session_ids) or 12),
+                )
+                if checklist_context:
+                    history_context = f"{checklist_context}\n\n{history_context}".strip()
             else:
                 selected_hits, _ = select_bundled_hits(
                     plan,
@@ -439,13 +541,17 @@ for index, instance in enumerate(instances, start=1):
 
         is_abs_question = question_id.endswith("_abs")
         if resolved_context_mode == "memory":
-            if (is_single_session_question(plan) or plan.is_multi_session) and history_context:
+            if (is_single_session_question(plan) or plan.is_multi_session or plan.is_temporal or plan.question_type == "knowledge-update") and history_context:
                 instructions = _build_memory_session_instructions(
                     plan=plan,
                     session_context=history_context,
                     evidence_sufficient=answerability["sufficient"] and not is_abs_question,
                     base_system_prompt=DEFAULT_SYSTEM_PROMPT,
                     strict_abstention=is_abs_question,
+                    is_knowledge_update=(plan.question_type == "knowledge-update"),
+                    has_temporal_view=plan.is_temporal and bool(structured_events),
+                    has_session_checklist=plan.is_multi_session,
+                    assistant_extraction=(plan.question_type == "single-session-assistant"),
                 )
             else:
                 instructions = build_benchmark_instructions(
@@ -526,7 +632,14 @@ for index, instance in enumerate(instances, start=1):
                     model=openai_model,
                     instructions=instructions,
                     user_input=query_text,
-                    max_output_tokens=max_new_tokens,
+                    max_output_tokens=(
+                        max(max_new_tokens, 256)
+                        if (
+                            plan.is_multi_session
+                            or (plan.is_temporal and ("order" in plan.question.lower() or plan.reasoning_kind == "ordering"))
+                        )
+                        else max_new_tokens
+                    ),
                     temperature=temperature,
                     top_p=top_p,
                     metadata={
@@ -552,61 +665,114 @@ for index, instance in enumerate(instances, start=1):
         print(format_trace(trace))
 
     usage = response["usage"]
-    prediction_rows.append(
-        {
-            "question_id": question_id,
-            "hypothesis": hypothesis,
-        }
-    )
-    detail_rows.append(
-        {
-            "question_id": question_id,
-            "question_type": instance.get("question_type"),
-            "question": instance.get("question"),
-            "answer": instance.get("answer"),
-            "hypothesis": hypothesis,
-            "raw_hypothesis": raw_hypothesis,
-            "openai_model": openai_model,
-            "response_id": response.get("response_id"),
-            "generation_mode": generation_mode,
-            "input_tokens": usage["input_tokens"],
-            "output_tokens": usage["output_tokens"],
-            "total_tokens": usage["total_tokens"],
-            "exact_match": exact_match_score(hypothesis, instance.get("answer", "")),
-            "contains_match": contains_match_score(hypothesis, instance.get("answer", "")),
-            "token_f1": token_f1_score(hypothesis, instance.get("answer", "")),
-            "abstention_accuracy": abstention_score(
-                hypothesis,
-                question_id.endswith("_abs"),
-            ),
-            "selected_memory_count": len(selected_hits),
-            "selected_memory_types": [hit.record.memory_type for hit in selected_hits],
-            "structured_event_count": len(structured_events),
-            "selected_session_ids": selected_session_ids(selected_hits),
-            "answer_session_ids": instance.get("answer_session_ids", []),
-            "selected_session_recall": selected_session_recall(
-                selected_hits,
-                instance.get("answer_session_ids", []),
-            ),
-            "answerable": answerability["sufficient"],
-            "answerability_reasons": answerability["reasons"],
-            "reader_context_mode": resolved_context_mode,
-            "history_session_count": len(instance.get("haystack_session_ids", [])),
-            "history_context_chars": len(history_context),
-            "solver_resolved": bool(solver_result and solver_result.resolved),
-            "solver_confidence": solver_result.confidence if solver_result else 0.0,
-            "solver_answer": solver_result.answer if solver_result else "",
-            "solver_mode": solver_result.mode if solver_result else "",
-        }
-    )
+    prediction_row = {
+        "question_id": question_id,
+        "hypothesis": hypothesis,
+    }
+    detail_row = {
+        "question_id": question_id,
+        "question_type": instance.get("question_type"),
+        "question": instance.get("question"),
+        "answer": instance.get("answer"),
+        "hypothesis": hypothesis,
+        "raw_hypothesis": raw_hypothesis,
+        "openai_model": openai_model,
+        "response_id": response.get("response_id"),
+        "generation_mode": generation_mode,
+        "input_tokens": usage["input_tokens"],
+        "output_tokens": usage["output_tokens"],
+        "total_tokens": usage["total_tokens"],
+        "exact_match": exact_match_score(hypothesis, instance.get("answer", "")),
+        "contains_match": contains_match_score(hypothesis, instance.get("answer", "")),
+        "token_f1": token_f1_score(hypothesis, instance.get("answer", "")),
+        "abstention_accuracy": abstention_score(
+            hypothesis,
+            question_id.endswith("_abs"),
+        ),
+        "selected_memory_count": len(selected_hits),
+        "selected_memory_types": [hit.record.memory_type for hit in selected_hits],
+        "structured_event_count": len(structured_events),
+        "selected_session_ids": selected_session_ids(selected_hits),
+        "answer_session_ids": instance.get("answer_session_ids", []),
+        "selected_session_recall": selected_session_recall(
+            selected_hits,
+            instance.get("answer_session_ids", []),
+        ),
+        "answerable": answerability["sufficient"],
+        "answerability_reasons": answerability["reasons"],
+        "reader_context_mode": resolved_context_mode,
+        "history_session_count": len(instance.get("haystack_session_ids", [])),
+        "history_context_chars": len(history_context),
+        "solver_resolved": bool(solver_result and solver_result.resolved),
+        "solver_confidence": solver_result.confidence if solver_result else 0.0,
+        "solver_answer": solver_result.answer if solver_result else "",
+        "solver_mode": solver_result.mode if solver_result else "",
+    }
+    return index, prediction_row, detail_row
 
-    if index % 10 == 0 or index == len(instances):
-        print(f"Processed {index}/{len(instances)} LongMemEval examples with OpenAI")
+
+def _ingest_history_threadsafe(store, embedder, instance, lock):
+    """Ingest history memories with thread-safe embedding calls."""
+    memories = list(iter_history_memories(
+        instance,
+        granularity=history_granularity,
+        include_assistant_turns=include_assistant_turns,
+    ))
+    # Batch-embed all texts under the lock for efficiency
+    texts = [m["text"] for m in memories]
+    with lock:
+        embeddings = embedder.embed_many(texts) if texts else []
+    for memory_item, emb in zip(memories, embeddings):
+        store.add_memory(
+            user_id=memory_user_id,
+            text=memory_item["text"],
+            memory_type=memory_item["memory_type"],
+            importance=memory_item["importance"],
+            embedding=emb,
+            embedding_model=embedder.model_name,
+            metadata=memory_item["metadata"],
+        )
+
+
+# ── Main execution: parallel or sequential ──────────────────────────────────
+prediction_rows = [None] * len(instances)
+detail_rows = [None] * len(instances)
+_completed = [0]
+_print_lock = threading.Lock()
+
+num_workers = max(1, parallel_workers)
+print(f"Processing {len(instances)} examples with {num_workers} parallel workers...")
+
+if num_workers <= 1:
+    # Sequential fallback
+    for idx, inst in enumerate(instances):
+        _, pred, det = _process_one(idx + 1, inst)
+        prediction_rows[idx] = pred
+        detail_rows[idx] = det
+        if (idx + 1) % 10 == 0 or (idx + 1) == len(instances):
+            print(f"Processed {idx + 1}/{len(instances)} LongMemEval examples with OpenAI")
+else:
+    with ThreadPoolExecutor(max_workers=num_workers) as pool:
+        futures = {
+            pool.submit(_process_one, idx + 1, inst): idx
+            for idx, inst in enumerate(instances)
+        }
+        for future in as_completed(futures):
+            idx = futures[future]
+            index_val, pred, det = future.result()
+            prediction_rows[idx] = pred
+            detail_rows[idx] = det
+            with _print_lock:
+                _completed[0] += 1
+                done = _completed[0]
+                if done % 10 == 0 or done == len(instances):
+                    print(f"Processed {done}/{len(instances)} LongMemEval examples with OpenAI")
 
 summary = summarize_records(detail_rows)
 summary.update(
     {
         "dataset_path": dataset_path,
+        "question_types": question_types,
         "memory_enabled": memory_enabled,
         "reader_context_mode": resolved_context_mode,
         "history_granularity": history_granularity,

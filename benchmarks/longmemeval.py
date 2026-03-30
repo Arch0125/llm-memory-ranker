@@ -101,14 +101,28 @@ _DAY_MONTH_RE = re.compile(
 _SHORT_MONTH_DAY_RE = re.compile(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b")
 _DATE_LINE_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
 _MONTH_DIFF_RE = re.compile(r"\b(\d+)\s*(month|months)\b", re.IGNORECASE)
+_WEEK_DIFF_RE = re.compile(r"\b(\d+)\s*(week|weeks)\b", re.IGNORECASE)
 _DAY_DIFF_RE = re.compile(r"\b(\d+)\s*(day|days)\b", re.IGNORECASE)
 _MONEY_RE = re.compile(r"\$(\d+(?:,\d{3})*(?:\.\d+)?)")
 _QUANTITY_RE = re.compile(
     r"\b(\d+(?:\.\d+)?)\s*(hours?|days?|weeks?|months?|years?|pages?)\b",
     re.IGNORECASE,
 )
+_PERCENT_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s*%")
 _TIME_OF_DAY_RE = re.compile(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", re.IGNORECASE)
 _DOCTOR_RE = re.compile(r"\bDr\.?\s+([A-Z][a-z]+)\b")
+_URL_RE = re.compile(r"https?://[^\s)>\"]+")
+_DOMAIN_RE = re.compile(r"\b(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b")
+_BULLET_LINE_RE = re.compile(r"^\s*(?:[-*]|\d+[.)])\s+(.+?)\s*$")
+_FINAL_ANSWER_RE = re.compile(r"(?:^|\b)final answer\s*:\s*(.+)$", re.IGNORECASE)
+_TOTAL_LINE_RE = re.compile(
+    r"\b(?:total|combined|in total|overall|altogether|therefore|so the total|final answer)\b",
+    re.IGNORECASE,
+)
+_ORDER_REQUEST_RE = re.compile(
+    r"\bwhat is the order\b|\bfrom earliest to latest\b|\bfrom latest to earliest\b",
+    re.IGNORECASE,
+)
 _LAST_WEEKDAY_RE = re.compile(
     r"\blast\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
     re.IGNORECASE,
@@ -833,12 +847,16 @@ def _subtract_months(value, months):
     while month <= 0:
         year -= 1
         month += 12
+    if not (1 <= year <= 9999):
+        return None
     day = min(value.day, monthrange(year, month)[1])
     return date(year, month, day)
 
 
 def _subtract_years(value, years):
     year = value.year - years
+    if not (1 <= year <= 9999):
+        return None
     day = min(value.day, monthrange(year, value.month)[1])
     return date(year, value.month, day)
 
@@ -908,6 +926,419 @@ def _format_numeric_value(value):
     if float(value).is_integer():
         return str(int(value))
     return str(round(float(value), 2)).rstrip("0").rstrip(".")
+
+
+def _canonicalize_person_reference(text):
+    value = normalize_answer(text)
+    value = re.sub(r"^you\b", "i", value)
+    value = re.sub(r"^your\b", "my", value)
+    value = value.replace(" your ", " my ")
+    value = value.replace(" you ", " i ")
+    return " ".join(value.split())
+
+
+def _split_answer_lines(text):
+    lines = []
+    for raw_line in _coerce_text(text).splitlines():
+        line = raw_line.strip()
+        if line:
+            lines.append(line)
+    return lines
+
+
+def _extract_number_like_candidates(text):
+    """Extract digit numbers and number words from text, skipping year-like 4-digit numbers."""
+    candidates = []
+    value = _coerce_text(text)
+    for match in re.finditer(r"\b\d+(?:\.\d+)?\b", value):
+        token = match.group(0)
+        if len(token) == 4 and token.startswith(("19", "20")):
+            continue
+        candidates.append(token)
+    # Also find number words (e.g. "three" → "3")
+    for match in re.finditer(
+        r"\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+        r"thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|"
+        r"twenty[\s-]?one|twenty[\s-]?two|twenty[\s-]?three|twenty[\s-]?four|"
+        r"twenty[\s-]?five|twenty[\s-]?six|twenty[\s-]?seven|twenty[\s-]?eight|"
+        r"twenty[\s-]?nine|thirty)\b",
+        value,
+        re.IGNORECASE,
+    ):
+        word = match.group(0).lower().replace("-", " ").strip()
+        num = _NUMBER_WORDS_EXTENDED.get(word)
+        if num is not None:
+            candidates.append(str(num))
+    return candidates
+
+
+_NUMBER_WORDS_EXTENDED = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+    "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
+    "nineteen": 19, "twenty": 20, "twenty one": 21, "twenty two": 22,
+    "twenty three": 23, "twenty four": 24, "twenty five": 25,
+    "twenty six": 26, "twenty seven": 27, "twenty eight": 28,
+    "twenty nine": 29, "thirty": 30,
+}
+
+
+def _extract_bullet_items(text):
+    items = []
+    for line in _split_answer_lines(text):
+        match = _BULLET_LINE_RE.match(line)
+        if not match:
+            continue
+        item = _collapse(match.group(1)).strip(" -:;,.")
+        if item:
+            items.append(item)
+    return items
+
+
+def _extract_named_value_from_statement(text):
+    value = _collapse(text).strip()
+    if not value:
+        return ""
+    for pattern in (
+        re.compile(r"\b(?:is|was|were|are)\s+(?:called\s+)?[\"']?([^.\n]+?)[\"']?(?:\.|$)", re.IGNORECASE),
+        re.compile(r"\b(?:named|titled)\s+[\"']?([^.\n]+?)[\"']?(?:\.|$)", re.IGNORECASE),
+    ):
+        match = pattern.search(value)
+        if match:
+            candidate = match.group(1).strip(" \"'")
+            candidate = re.split(r"\s+(?:and|with|which)\s+", candidate, maxsplit=1)[0].strip(" ,.;")
+            if candidate:
+                return candidate
+    return ""
+
+
+def _extract_multi_session_count_answer(text):
+    value = _coerce_text(text)
+    if not value:
+        return ""
+    final_match = _FINAL_ANSWER_RE.search(value)
+    if final_match:
+        final_numbers = _extract_number_like_candidates(final_match.group(1))
+        if final_numbers:
+            return _format_numeric_value(float(final_numbers[-1]))
+        parsed = _parse_numeric_token(final_match.group(1))
+        if parsed is not None:
+            return str(parsed)
+    # Look for math expressions like "3 + 5 = 8" and extract the result
+    math_result = _extract_math_result(value)
+    # Look for summary/total lines
+    prioritized = []
+    for line in _split_answer_lines(value):
+        lowered = normalize_answer(line)
+        if _TOTAL_LINE_RE.search(line) or any(
+            phrase in lowered
+            for phrase in (
+                "there are",
+                "there were",
+                "you have",
+                "you attended",
+                "you visited",
+                "you used",
+                "you mentioned",
+                "you baked",
+                "you cooked",
+                "you played",
+                "you bought",
+                "you acquired",
+                "you replaced",
+                "you fixed",
+                "you completed",
+                "you listened",
+                "counting only",
+                "in summary",
+                "that makes",
+                "that gives",
+                "which is",
+                "which gives",
+                "which makes",
+                "bringing the total",
+            )
+        ):
+            numbers = _extract_number_like_candidates(line)
+            # Filter out numbers that are part of time expressions
+            filtered = _filter_time_period_numbers(line, numbers)
+            if filtered:
+                prioritized.extend(filtered)
+            else:
+                parsed = _parse_numeric_token(line)
+                if parsed is not None:
+                    prioritized.append(str(parsed))
+    if prioritized:
+        return _format_numeric_value(float(prioritized[-1]))
+    # If we found a math result (e.g., "3 + 5 = 8"), use it
+    if math_result is not None:
+        return _format_numeric_value(math_result)
+    bullet_items = _extract_bullet_items(value)
+    if len(bullet_items) >= 2:
+        return str(len(bullet_items))
+    # Count enumerated items in verbose text (e.g., "1. item, 2. item, 3. item")
+    enum_count = _count_enumerated_items(value)
+    if enum_count >= 2:
+        return str(enum_count)
+    numbers = _extract_number_like_candidates(value)
+    # Filter out time-period numbers from the full text
+    filtered_numbers = _filter_time_period_numbers(value, numbers)
+    if filtered_numbers:
+        return _format_numeric_value(float(filtered_numbers[-1]))
+    # If ALL numbers were time-period numbers, don't use them — return empty
+    # to let the general postprocessor handle it
+    if numbers and not filtered_numbers:
+        # All candidates were time references; don't return a misleading number
+        return ""
+    if numbers:
+        return _format_numeric_value(float(numbers[-1]))
+    parsed = _parse_numeric_token(value)
+    if parsed is not None:
+        return str(parsed)
+    return ""
+
+
+def _filter_time_period_numbers(text, numbers):
+    """Filter out numbers that appear as part of time period expressions like '2 months ago'."""
+    if not numbers:
+        return numbers
+    lowered = text.lower()
+    time_number_strs = set()
+    # Digit time periods: "2 months ago", "3 weeks later"
+    for match in re.finditer(
+        r"\b(\d+)\s+(?:days?|weeks?|months?|years?)\s*(?:ago|before|after|later|earlier|prior|back)\b",
+        lowered,
+    ):
+        time_number_strs.add(match.group(1))
+    # "past X months/weeks" patterns
+    for match in re.finditer(
+        r"\b(?:past|last|previous|next|about|around|approximately)\s+(\d+)\s+(?:days?|weeks?|months?|years?)\b",
+        lowered,
+    ):
+        time_number_strs.add(match.group(1))
+    # Number words in time periods: "three weeks ago", "about two months ago"
+    _TIME_WORD_RE = re.compile(
+        r"\b(?:about\s+|around\s+|approximately\s+)?"
+        r"(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)"
+        r"\s+(?:days?|weeks?|months?|years?)"
+        r"\s*(?:ago|before|after|later|earlier|prior|back)\b",
+        re.IGNORECASE,
+    )
+    for match in _TIME_WORD_RE.finditer(lowered):
+        word_num = _NUMBER_WORDS.get(match.group(1).lower())
+        if word_num is not None:
+            time_number_strs.add(str(word_num))
+    # "past/last X months" with number words
+    _PAST_WORD_RE = re.compile(
+        r"\b(?:past|last|previous|next)\s+"
+        r"(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)"
+        r"\s+(?:days?|weeks?|months?|years?)\b",
+        re.IGNORECASE,
+    )
+    for match in _PAST_WORD_RE.finditer(lowered):
+        word_num = _NUMBER_WORDS.get(match.group(1).lower())
+        if word_num is not None:
+            time_number_strs.add(str(word_num))
+    if not time_number_strs:
+        return numbers
+    return [n for n in numbers if n not in time_number_strs]
+
+
+def _extract_math_result(text):
+    """Extract the result from math expressions like '3 + 5 = 8' or '15 + 50 = 65'."""
+    for match in re.finditer(r"=\s*(\d+(?:\.\d+)?)\b", text):
+        try:
+            return float(match.group(1))
+        except ValueError:
+            pass
+    return None
+
+
+def _count_enumerated_items(text):
+    """Count items listed with connectors like 'also', 'additionally', 'as well'."""
+    lines = _split_answer_lines(text)
+    # Check for numbered items like "1. X, 2. Y, 3. Z" in a single line
+    for line in lines:
+        enum_matches = list(re.finditer(r"\b(\d+)\.\s", line))
+        if len(enum_matches) >= 2:
+            return int(enum_matches[-1].group(1))
+    return 0
+
+
+def _extract_multi_session_money_answer(text):
+    value = _coerce_text(text)
+    if not value:
+        return ""
+    final_match = _FINAL_ANSWER_RE.search(value)
+    if final_match:
+        money_match = list(_MONEY_RE.finditer(final_match.group(1)))
+        if money_match:
+            amount = _parse_amount_token(money_match[-1].group(1))
+            if amount is not None:
+                return _format_money(amount)
+    # Look for math expression with = sign (e.g., "$15 + $50 = $65")
+    for line in _split_answer_lines(value):
+        eq_match = re.search(r"=\s*\$(\d+(?:,\d{3})*(?:\.\d+)?)", line)
+        if eq_match:
+            amount = _parse_amount_token(eq_match.group(1))
+            if amount is not None:
+                return _format_money(amount)
+    prioritized = []
+    for line in _split_answer_lines(value):
+        lowered_line = normalize_answer(line)
+        if _TOTAL_LINE_RE.search(line) or any(
+            phrase in lowered_line
+            for phrase in ("spent", "difference", "more", "less", "per night", "total cost", "total amount", "sum")
+        ):
+            line_matches = list(_MONEY_RE.finditer(line))
+            if line_matches:
+                # If multiple amounts on a summary line, sum them (e.g., "$15 + $50")
+                if len(line_matches) >= 2 and not _TOTAL_LINE_RE.search(line):
+                    amounts = [_parse_amount_token(m.group(1)) for m in line_matches]
+                    amounts = [a for a in amounts if a is not None]
+                    if amounts:
+                        return _format_money(sum(amounts))
+                prioritized.extend(line_matches)
+    if prioritized:
+        amount = _parse_amount_token(prioritized[-1].group(1))
+        if amount is not None:
+            return _format_money(amount)
+    money_matches = list(_MONEY_RE.finditer(value))
+    if money_matches:
+        # If there are 2+ amounts and no total/summary line found, sum them
+        if len(money_matches) >= 2:
+            amounts = []
+            for m in money_matches:
+                a = _parse_amount_token(m.group(1))
+                if a is not None:
+                    amounts.append(a)
+            if amounts:
+                lowered = value.lower()
+                if any(kw in lowered for kw in ("and", "plus", "+", "also")):
+                    return _format_money(sum(amounts))
+        # Single amount or fallback to last
+        amount = _parse_amount_token(money_matches[-1].group(1))
+        if amount is not None:
+            return _format_money(amount)
+    return ""
+
+
+def _extract_multi_session_quantity_answer(text, unit_hint=""):
+    value = _coerce_text(text)
+    if not value:
+        return ""
+    normalized_unit = _normalize_unit(unit_hint or "")
+
+    def matching_quantities(source):
+        matches = []
+        for quantity_match in _QUANTITY_RE.finditer(source):
+            found_unit = _normalize_unit(quantity_match.group(2))
+            if normalized_unit and found_unit != normalized_unit:
+                continue
+            matches.append(quantity_match)
+        return matches
+
+    final_match = _FINAL_ANSWER_RE.search(value)
+    if final_match:
+        matches = matching_quantities(final_match.group(1))
+        if matches:
+            match = matches[-1]
+            return f"{_format_numeric_value(float(match.group(1)))} {match.group(2).lower()}"
+        # If no unit match, try just extracting numbers from the final answer line
+        numbers = _extract_number_like_candidates(final_match.group(1))
+        if numbers:
+            unit = unit_hint or ""
+            return f"{_format_numeric_value(float(numbers[-1]))} {unit}".strip()
+    # Look for math results on = lines
+    prioritized = []
+    for line in _split_answer_lines(value):
+        if _TOTAL_LINE_RE.search(line) or "=" in line:
+            prioritized.extend(matching_quantities(line))
+            if not prioritized:
+                numbers = _extract_number_like_candidates(line)
+                filtered = _filter_time_period_numbers(line, numbers)
+                if filtered:
+                    unit = unit_hint or ""
+                    return f"{_format_numeric_value(float(filtered[-1]))} {unit}".strip()
+                if numbers:
+                    unit = unit_hint or ""
+                    return f"{_format_numeric_value(float(numbers[-1]))} {unit}".strip()
+    if prioritized:
+        match = prioritized[-1]
+        return f"{_format_numeric_value(float(match.group(1)))} {match.group(2).lower()}"
+    matches = matching_quantities(value)
+    if matches:
+        match = matches[-1]
+        return f"{_format_numeric_value(float(match.group(1)))} {match.group(2).lower()}"
+    if normalized_unit:
+        numbers = _extract_number_like_candidates(value)
+        filtered = _filter_time_period_numbers(value, numbers)
+        if filtered:
+            return f"{_format_numeric_value(float(filtered[-1]))} {unit_hint}".strip()
+        if numbers:
+            return f"{_format_numeric_value(float(numbers[-1]))} {unit_hint}".strip()
+    return ""
+
+
+def _extract_other_option_list(text, excluded_values):
+    items = _extract_bullet_items(text)
+    if not items:
+        return ""
+    excluded = {normalize_answer(value) for value in excluded_values if value}
+    cleaned = []
+    for item in items:
+        normalized = normalize_answer(item)
+        if not normalized or normalized in excluded:
+            continue
+        cleaned.append(item.strip(" \"'"))
+    return ", ".join(cleaned)
+
+
+def _extract_single_session_assistant_answer(plan, text):
+    raw_value = _coerce_text(text).strip()
+    value = _collapse(raw_value).strip()
+    if not value:
+        return ""
+    question = (plan.question or "").lower()
+    if any(marker in normalize_answer(value) for marker in _ABSTENTION_MARKERS):
+        return "Insufficient evidence"
+    if "other" in question and "option" in question:
+        other_options = _extract_other_option_list(raw_value, plan.targets)
+        if other_options:
+            return other_options
+    if "website" in question or "site" in question or "url" in question or "link" in question:
+        url_match = _URL_RE.search(value)
+        if url_match:
+            return url_match.group(0).rstrip(".,)")
+        domain_match = _DOMAIN_RE.search(value)
+        if domain_match:
+            return domain_match.group(0).rstrip(".,)")
+    if "youtube" in question or "video" in question:
+        quoted = re.findall(r"['\"]([^'\"]+)['\"]", value)
+        if quoted:
+            return quoted[0].strip()
+        named = _extract_named_value_from_statement(value)
+        if named:
+            return named
+    if "quote" in question or ("what did" in question and "say" in question):
+        quoted = re.findall(r"['\"]([^'\"]+)['\"]", value)
+        if quoted:
+            return max((item.strip() for item in quoted), key=len)
+    if question.startswith("how many") or "average improvement" in question or "%" in value:
+        percent_match = _PERCENT_RE.search(value)
+        if percent_match:
+            return f"{percent_match.group(1)}%"
+        number = _extract_multi_session_count_answer(value)
+        if number:
+            return number
+    named = _extract_named_value_from_statement(value)
+    if named:
+        return named
+    first_sentence = re.split(r"(?<=[.!?])\s+", value, maxsplit=1)[0].strip(" \"'")
+    if first_sentence:
+        return first_sentence
+    return value
 
 
 def _weekday_relative_date(base_date, weekday_name, qualifier):
@@ -1448,6 +1879,8 @@ def _derive_event_date_candidates(text, session_date):
             unit = match.group(2).lower()
             if not amount:
                 continue
+            if unit.startswith("year") and amount > 150:
+                continue
             if unit.startswith("day"):
                 derived = base_date - timedelta(days=amount)
             elif unit.startswith("week"):
@@ -1636,7 +2069,7 @@ def _extract_question_targets(question):
     lowered = question.lower()
     quoted_targets = [match.strip() for match in re.findall(r"['\"]([^'\"]+)['\"]", question)]
     if len(quoted_targets) >= 2:
-        targets = quoted_targets[:2]
+        targets = quoted_targets
     else:
         match = _QUESTION_OR_RE.search(question)
         if match:
@@ -1687,6 +2120,13 @@ def _extract_question_targets(question):
         seen.add(normalized)
         deduped.append(target)
     return deduped
+
+
+def _requires_full_order_answer(plan):
+    if plan.reasoning_kind != "ordering":
+        return False
+    question = plan.question or ""
+    return bool(_ORDER_REQUEST_RE.search(question))
 
 
 def _target_aliases(text):
@@ -2318,6 +2758,7 @@ def _solve_multi_session_from_entries(plan, entries):
         seen = set()
         values = []
         supporting = []
+        first_summed_unit = None
         for entry in relevant:
             key = normalize_answer(_entry_display_key(plan, entry))
             for item in entry.get("quantity_values", []):
@@ -2334,9 +2775,11 @@ def _solve_multi_session_from_entries(plan, entries):
                 seen.add(dedupe_key)
                 values.append(item["value"])
                 supporting.append(entry)
+                if first_summed_unit is None:
+                    first_summed_unit = item.get("unit") or ""
         if values:
             total = sum(values)
-            answer_unit = plan.unit_hint or (relevant[0].get("quantity_values", [{}])[0].get("unit", "") if relevant else "")
+            answer_unit = plan.unit_hint or first_summed_unit or ""
             return TemporalSolution(
                 True,
                 f"{_format_numeric_value(total)} {answer_unit}".strip(),
@@ -2728,6 +3171,9 @@ def analyze_question(instance, include_question_date=True):
         elif "what was the date" in lowered or "which date" in lowered:
             reasoning_kind = "date"
             ordering_direction = "last" if " last" in lowered else "first"
+        elif "what is the order" in lowered or "from earliest to latest" in lowered or "from latest to earliest" in lowered:
+            reasoning_kind = "ordering"
+            ordering_direction = "last" if "from latest to earliest" in lowered else "first"
         elif any(token in lowered for token in ("first", "last", "before", "after")):
             reasoning_kind = "ordering"
             ordering_direction = "last" if " last" in lowered else "first"
@@ -2779,7 +3225,15 @@ def exact_match_score(prediction, answer):
     if not variants:
         return 0.0
     normalized_prediction = normalize_answer(prediction)
-    return float(any(normalized_prediction == normalize_answer(variant) for variant in variants))
+    pred_digit = _normalize_number_words_in_text(normalized_prediction)
+    for variant in variants:
+        norm_variant = normalize_answer(variant)
+        if normalized_prediction == norm_variant:
+            return 1.0
+        # Number-word normalized comparison
+        if pred_digit == _normalize_number_words_in_text(norm_variant):
+            return 1.0
+    return 0.0
 
 
 def contains_match_score(prediction, answer):
@@ -2787,13 +3241,32 @@ def contains_match_score(prediction, answer):
     variants = acceptable_answers(answer)
     if not normalized_prediction or not variants:
         return 0.0
-    return float(
-        any(
-            normalize_answer(variant) in normalized_prediction
-            or normalized_prediction in normalize_answer(variant)
-            for variant in variants
-        )
-    )
+    # Also create digit-normalized versions for number word ↔ digit matching
+    pred_digit = _normalize_number_words_in_text(normalized_prediction)
+    for variant in variants:
+        norm_variant = normalize_answer(variant)
+        variant_digit = _normalize_number_words_in_text(norm_variant)
+        # Standard containment check
+        if norm_variant in normalized_prediction or normalized_prediction in norm_variant:
+            return 1.0
+        # Number-normalized containment check
+        if variant_digit in pred_digit or pred_digit in variant_digit:
+            return 1.0
+    return 0.0
+
+
+def _normalize_number_words_in_text(text):
+    """Replace number words with digits in text for matching purposes."""
+    result = text
+    # Replace multi-word numbers first (e.g., "twenty three")
+    for word, num in sorted(_NUMBER_WORDS_EXTENDED.items(), key=lambda x: -len(x[0])):
+        if " " in word:
+            result = re.sub(r"\b" + re.escape(word) + r"\b", str(num), result)
+    # Then single words
+    for word, num in _NUMBER_WORDS_EXTENDED.items():
+        if " " not in word:
+            result = re.sub(r"\b" + re.escape(word) + r"\b", str(num), result)
+    return result
 
 
 def token_f1_score(prediction, answer):
@@ -2896,8 +3369,8 @@ def multi_session_session_limit(plan):
     if not plan.is_multi_session:
         return 0
     if plan.multi_session_kind in {"count_entries", "count_distinct", "sum_money", "sum_quantity"}:
-        return 8
-    return 6
+        return 12
+    return 8
 
 
 def _choose_single_session_limit(plan, ranked_sessions, max_sessions):
@@ -3769,6 +4242,45 @@ def build_structured_event_view(plan, selected_hits, limit=8):
     return events[:limit]
 
 
+def build_temporal_event_context(plan, selected_hits, limit=12):
+    if not plan.is_temporal:
+        return ""
+    events = build_structured_event_view(plan, selected_hits, limit=limit)
+    if not events:
+        return ""
+    lines = ["Structured event/date view:"]
+    for index, event in enumerate(events, start=1):
+        lines.append(render_structured_event_line(event, index=index))
+    return "\n".join(lines)
+
+
+def build_multi_session_checklist_context(plan, selected_hits, limit=12):
+    if not plan.is_multi_session:
+        return ""
+    entries = _build_multi_session_entries_from_hits(plan, selected_hits)
+    if not entries:
+        return ""
+    for entry in entries:
+        entry["score"] = _multi_session_entry_score(plan, entry)
+    entries.sort(key=lambda item: item.get("score", 0.0), reverse=True)
+    lines = ["Session-by-session checklist:"]
+    for index, entry in enumerate(entries[:limit], start=1):
+        summary = _summarize_multi_session_entry(plan, entry)
+        extra = ""
+        if plan.multi_session_kind in {"count_entries", "count_distinct"}:
+            values = _distinct_values_for_entry(plan, entry) if plan.multi_session_kind == "count_distinct" else _count_values_for_entry(plan, entry)
+            if values:
+                extra = " ; candidates=" + ", ".join(values[:5])
+        elif plan.multi_session_kind in {"sum_money", "difference_money"} and entry.get("currency_values"):
+            extra = " ; amounts=" + ", ".join(item["raw"] for item in entry["currency_values"][:4])
+        elif plan.multi_session_kind == "sum_quantity" and entry.get("quantity_values"):
+            extra = " ; quantities=" + ", ".join(item["raw"] for item in entry["quantity_values"][:4])
+        elif plan.multi_session_kind == "time_lookup" and entry.get("clock_times"):
+            extra = " ; times=" + ", ".join(item["text"] for item in entry["clock_times"][:2])
+        lines.append(f"{index}. {summary}{extra}")
+    return "\n".join(lines)
+
+
 def solve_temporal_question(plan, selected_hits):
     if plan.is_multi_session:
         aggregate_candidates = [
@@ -3822,6 +4334,26 @@ def solve_temporal_question(plan, selected_hits):
         )
 
     if plan.reasoning_kind == "ordering" and len(plan.targets) >= 2:
+        matched = []
+        for target in plan.targets:
+            event = _select_target_event(plan, events, target)
+            if not event:
+                continue
+            event_date = _date_from_event(event)
+            if not event_date:
+                continue
+            matched.append((target, event, event_date))
+        if _requires_full_order_answer(plan) and len(matched) >= 2:
+            matched.sort(key=lambda item: item[2], reverse=(plan.ordering_direction == "last"))
+            return TemporalSolution(
+                resolved=True,
+                answer=", ".join(item[0] for item in matched),
+                confidence=min(item[1]["date_confidence"] for item in matched),
+                rationale=", ".join(item[1]["event_date"] for item in matched),
+                mode="full-ordering",
+                supporting_memory_ids=[item[1]["memory_id"] for item in matched],
+                supporting_dates=[item[1]["event_date"] for item in matched],
+            )
         first = _select_target_event(plan, events, plan.targets[0])
         second = _select_target_event(plan, events, plan.targets[1])
         if not first or not second:
@@ -3994,6 +4526,7 @@ def build_benchmark_instructions(plan, selected_hits, answerability, base_system
 
 
 def postprocess_prediction(plan, text):
+    raw_text = _coerce_text(text)
     value = _collapse(text)
     if not value:
         return value
@@ -4009,34 +4542,23 @@ def postprocess_prediction(plan, text):
             "there is no information",
         )
     )
+    if plan.question_type == "single-session-assistant":
+        extracted = _extract_single_session_assistant_answer(plan, raw_text)
+        if extracted:
+            return extracted
     if plan.is_multi_session:
         if plan.multi_session_kind in {"count_entries", "count_distinct"}:
-            # Try digit first
-            match = re.search(r"\b\d+\b", value)
-            if match:
-                return match.group(0)
-            # Try number words ("three" → "3")
-            for word, num in _NUMBER_WORDS.items():
-                if re.search(r'\b' + re.escape(word) + r'\b', lowered_value):
-                    return str(num)
+            extracted = _extract_multi_session_count_answer(value)
+            if extracted:
+                return extracted
         if plan.multi_session_kind == "sum_money":
-            money_match = _MONEY_RE.search(value)
-            if money_match:
-                return _format_money(_parse_amount_token(money_match.group(0)))
-            # Try bare number with dollar context
-            if "dollar" in lowered_value or "$" in value or "spent" in lowered_value:
-                num_match = re.search(r"\b\d+(?:\.\d+)?\b", value)
-                if num_match:
-                    return _format_money(float(num_match.group(0)))
+            extracted = _extract_multi_session_money_answer(value)
+            if extracted:
+                return extracted
         if plan.multi_session_kind == "sum_quantity":
-            unit = _normalize_unit(plan.unit_hint or "")
-            for quantity_match in _QUANTITY_RE.finditer(value):
-                found_unit = _normalize_unit(quantity_match.group(2))
-                if not unit or found_unit == unit:
-                    return f"{_format_numeric_value(float(quantity_match.group(1)))} {quantity_match.group(2).lower()}"
-            number_match = re.search(r"\b\d+(?:\.\d+)?\b", value)
-            if number_match and plan.unit_hint:
-                return f"{_format_numeric_value(float(number_match.group(0)))} {plan.unit_hint}"
+            extracted = _extract_multi_session_quantity_answer(value, plan.unit_hint)
+            if extracted:
+                return extracted
         if plan.multi_session_kind == "time_lookup":
             time_match = _TIME_OF_DAY_RE.search(value)
             if time_match:
@@ -4052,6 +4574,22 @@ def postprocess_prediction(plan, text):
             match = _MONTH_DIFF_RE.search(value)
             if match:
                 return f"{match.group(1)} {match.group(2).lower()}"
+        elif unit == "weeks":
+            # First look for an explicit week mention
+            match = _WEEK_DIFF_RE.search(value)
+            if match:
+                return f"{match.group(1)} {match.group(2).lower()}"
+            # Convert days → weeks if the model answered in days
+            day_match = _DAY_DIFF_RE.search(value)
+            if day_match:
+                days = int(day_match.group(1))
+                if days % 7 == 0:
+                    weeks = days // 7
+                    return f"{weeks} {'week' if weeks == 1 else 'weeks'}"
+                # Approximate: round to nearest week
+                weeks = round(days / 7)
+                if weeks > 0:
+                    return f"{weeks} {'week' if weeks == 1 else 'weeks'}"
         else:
             match = _DAY_DIFF_RE.search(value)
             if match:
@@ -4060,7 +4598,20 @@ def postprocess_prediction(plan, text):
             lower_line = line.lower()
             if "cannot determine" in lower_line or "not possible" in lower_line or "insufficient" in lower_line:
                 continue
-            match = (_MONTH_DIFF_RE if unit == "months" else _DAY_DIFF_RE).search(line)
+            if unit == "months":
+                match = _MONTH_DIFF_RE.search(line)
+            elif unit == "weeks":
+                match = _WEEK_DIFF_RE.search(line)
+                if not match:
+                    day_match = _DAY_DIFF_RE.search(line)
+                    if day_match:
+                        days = int(day_match.group(1))
+                        weeks = round(days / 7)
+                        if weeks > 0:
+                            return f"{weeks} {'week' if weeks == 1 else 'weeks'}"
+                    continue
+            else:
+                match = _DAY_DIFF_RE.search(line)
             if match:
                 return f"{match.group(1)} {match.group(2).lower()}"
     if plan.reasoning_kind == "date":
@@ -4088,15 +4639,73 @@ def postprocess_prediction(plan, text):
             month = day_month.group(2).capitalize()
             day = day_month.group(1)
             return f"{month} {day}"
+    if plan.reasoning_kind == "ordering" and _requires_full_order_answer(plan):
+        if plan.targets:
+            bullet_items = _extract_bullet_items(raw_text)
+            if bullet_items:
+                ordered_targets = []
+                seen_targets = set()
+                for item in bullet_items:
+                    normalized_item = _canonicalize_person_reference(item)
+                    for raw, normalized in zip(plan.targets, plan.normalized_targets):
+                        candidate_aliases = {_canonicalize_person_reference(normalized)}
+                        candidate_aliases.update(_canonicalize_person_reference(alias) for alias in _target_aliases(raw))
+                        if any(alias and _phrase_matches_text(alias, normalized_item) for alias in candidate_aliases):
+                            normalized_raw = normalize_answer(raw)
+                            if normalized_raw not in seen_targets:
+                                seen_targets.add(normalized_raw)
+                                ordered_targets.append(raw)
+                            break
+                if len(ordered_targets) >= 2:
+                    return ", ".join(ordered_targets)
+            ranked_targets = []
+            lowered = _canonicalize_person_reference(value)
+            for raw, normalized in zip(plan.targets, plan.normalized_targets):
+                aliases = [_canonicalize_person_reference(normalized)] + [
+                    _canonicalize_person_reference(alias) for alias in _target_aliases(raw)
+                ]
+                positions = []
+                for alias in aliases:
+                    if not alias:
+                        continue
+                    idx = lowered.find(alias)
+                    if idx != -1:
+                        positions.append(idx)
+                if positions:
+                    ranked_targets.append((min(positions), raw))
+            if len(ranked_targets) >= 2:
+                ranked_targets.sort(key=lambda item: item[0])
+                return ", ".join(target for _, target in ranked_targets)
+        return value.splitlines()[0].strip(" \"'")
     if has_abstention_marker and plan.reasoning_kind in {"difference", "date"}:
         return "Insufficient evidence"
-    if plan.normalized_targets:
+    if plan.normalized_targets and plan.question_type != "single-session-assistant":
         lowered = normalize_answer(value)
         for raw, normalized in zip(plan.targets, plan.normalized_targets):
             if normalized and _phrase_matches_text(normalized, lowered):
                 return raw
     if has_abstention_marker:
         return "Insufficient evidence"
+    # For multi-session count questions that didn't get extracted above,
+    # try harder with the raw text
+    if plan.is_multi_session and plan.multi_session_kind in {"count_entries", "count_distinct"}:
+        # Try to find a number in the last sentence (often the summary)
+        sentences = re.split(r"[.!]\s+", raw_text.strip())
+        for sent in reversed(sentences):
+            nums = _extract_number_like_candidates(sent)
+            filtered = _filter_time_period_numbers(sent, nums)
+            if filtered:
+                return _format_numeric_value(float(filtered[-1]))
+            if nums:
+                return _format_numeric_value(float(nums[-1]))
+    # For multi-session sum questions, try the raw text
+    if plan.is_multi_session and plan.multi_session_kind in {"sum_money", "sum_quantity"}:
+        math_result = _extract_math_result(raw_text)
+        if math_result is not None:
+            if plan.multi_session_kind == "sum_money":
+                return _format_money(math_result)
+            unit = plan.unit_hint or ""
+            return f"{_format_numeric_value(math_result)} {unit}".strip()
     return value.splitlines()[0].strip(" \"'")
 
 

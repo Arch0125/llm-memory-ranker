@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from benchmarks.argv_overrides import apply_argv_overrides
+from benchmarks.question_type_filters import normalize_question_types
 from benchmarks.longmemeval import (
     build_official_retrieval_log_entry,
     load_longmemeval_instances,
@@ -25,7 +27,8 @@ start_index = 0
 question_types = ""
 granularity = "turn"
 memory_embedder = "benchmark-auto"
-exec(open("configurator.py").read())  # overrides from command line or config file
+apply_argv_overrides(globals())
+question_types = normalize_question_types(question_types)
 
 
 if granularity not in {"session", "turn"}:
@@ -66,6 +69,7 @@ summary = summarize_official_retrieval_logs(rows)
 summary.update(
     {
         "dataset_path": dataset_path,
+        "question_types": question_types,
         "granularity": granularity,
         "memory_embedder": memory_embedder,
         "output_path": output_path,

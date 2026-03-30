@@ -224,6 +224,27 @@ class LongMemEvalHelpersTest(unittest.TestCase):
         memories = list(iter_history_memories(instance, granularity="turn", include_assistant_turns=False))
         self.assertEqual(memories[0]["metadata"]["event_date"], "2023-04-24")
 
+    def test_iter_history_memories_turn_granularity_ignores_extreme_relative_years(self):
+        instance = {
+            "question_id": "q-relative-extreme-years",
+            "question_type": "multi-session",
+            "question": "How many minutes did I exceed my target time by in the marathon?",
+            "answer": "5",
+            "question_date": "2023/05/30 (Tue) 22:30",
+            "haystack_session_ids": ["s1"],
+            "haystack_dates": ["2023/05/27 (Sat) 18:50"],
+            "haystack_sessions": [[
+                {
+                    "role": "user",
+                    "content": "Research note: Number systems have progressed from the use of fingers and tally marks, perhaps more than 40,000 years ago, to the use of sets of glyphs able to represent numbers efficiently.",
+                    "has_answer": False,
+                }
+            ]],
+            "answer_session_ids": [],
+        }
+        memories = list(iter_history_memories(instance, granularity="turn", include_assistant_turns=False))
+        self.assertEqual(memories[0]["metadata"]["event_date"], "2023-05-27")
+
     def test_build_history_context_full_history_excludes_assistant_when_requested(self):
         instance = {
             "question_id": "q-history",
@@ -820,6 +841,137 @@ class LongMemEvalHelpersTest(unittest.TestCase):
         plan = analyze_question(instance)
         prediction = "You attended the first BBQ event in June on the 3rd of June."
         self.assertEqual(postprocess_prediction(plan, prediction), "June 3")
+
+    def test_postprocess_prediction_multi_session_count_prefers_total_over_list_indices(self):
+        instance = {
+            "question_id": "q-ms-count-post",
+            "question_type": "multi-session",
+            "question": "How many different types of citrus fruits have I used in my cocktail recipes?",
+            "answer": "3",
+            "question_date": "2024/05/30 (Thu) 09:00",
+            "haystack_session_ids": [],
+            "haystack_dates": [],
+            "haystack_sessions": [],
+            "answer_session_ids": [],
+        }
+        plan = analyze_question(instance)
+        prediction = (
+            "Here are the different citrus fruits mentioned:\n"
+            "1. Orange\n"
+            "2. Lemon\n"
+            "3. Lime\n"
+            "Total distinct types of citrus fruits used: 3"
+        )
+        self.assertEqual(postprocess_prediction(plan, prediction), "3")
+
+    def test_postprocess_prediction_multi_session_sum_quantity_prefers_total_line(self):
+        instance = {
+            "question_id": "q-ms-hours-post",
+            "question_type": "multi-session",
+            "question": "How many hours in total did I spend driving to my three road trip destinations combined?",
+            "answer": "15 hours",
+            "question_date": "2024/05/30 (Thu) 09:00",
+            "haystack_session_ids": [],
+            "haystack_dates": [],
+            "haystack_sessions": [],
+            "answer_session_ids": [],
+        }
+        plan = analyze_question(instance)
+        prediction = (
+            "You drove 4 hours to one destination, 5 hours to another, and 6 hours to the last one.\n"
+            "Total driving time = 4 + 5 + 6 = 15 hours."
+        )
+        self.assertEqual(postprocess_prediction(plan, prediction), "15 hours")
+
+    def test_postprocess_prediction_full_ordering_preserves_all_targets(self):
+        instance = {
+            "question_id": "q-order-3",
+            "question_type": "temporal-reasoning",
+            "question": "What is the order of the three events: 'I signed up for the rewards program at ShopRite', 'I used a Buy One Get One Free coupon on Luvs diapers at Walmart', and 'I redeemed $12 cashback for a $10 Amazon gift card from Ibotta'?",
+            "answer": "First, I used a Buy One Get One Free coupon on Luvs diapers at Walmart. Then, I redeemed $12 cashback for a $10 Amazon gift card from Ibotta. Finally, I signed up for the rewards program at ShopRite.",
+            "question_date": "2023/04/03 (Mon) 09:00",
+            "haystack_session_ids": [],
+            "haystack_dates": [],
+            "haystack_sessions": [],
+            "answer_session_ids": [],
+        }
+        plan = analyze_question(instance)
+        prediction = (
+            "The order of the three events is:\n"
+            "1. You used a Buy One Get One Free coupon on Luvs diapers at Walmart.\n"
+            "2. You redeemed $12 cashback for a $10 Amazon gift card from Ibotta.\n"
+            "3. You signed up for the rewards program at ShopRite."
+        )
+        self.assertEqual(
+            postprocess_prediction(plan, prediction),
+            "I used a Buy One Get One Free coupon on Luvs diapers at Walmart, I redeemed $12 cashback for a $10 Amazon gift card from Ibotta, I signed up for the rewards program at ShopRite",
+        )
+
+    def test_solve_temporal_question_full_ordering_with_three_targets(self):
+        instance = {
+            "question_id": "q-order-solver-3",
+            "question_type": "temporal-reasoning",
+            "question": "What is the order of the three events: 'alpha event', 'beta event', and 'gamma event'?",
+            "answer": "alpha event, beta event, gamma event",
+            "question_date": "2024/02/10 (Sat) 09:00",
+            "haystack_session_ids": [],
+            "haystack_dates": [],
+            "haystack_sessions": [],
+            "answer_session_ids": [],
+        }
+        plan = analyze_question(instance)
+        hits = [
+            make_hit("s1", text="2024-01-02 | alpha event", event_date="2024-01-02", entities=["alpha event"]),
+            make_hit("s2", text="2024-01-03 | beta event", event_date="2024-01-03", entities=["beta event"]),
+            make_hit("s3", text="2024-01-04 | gamma event", event_date="2024-01-04", entities=["gamma event"]),
+        ]
+        result = solve_temporal_question(plan, hits)
+        self.assertTrue(result.resolved)
+        self.assertEqual(result.answer, "alpha event, beta event, gamma event")
+
+    def test_postprocess_prediction_single_session_assistant_extracts_other_options(self):
+        instance = {
+            "question_id": "q-assistant-other",
+            "question_type": "single-session-assistant",
+            "question": "You suggested 'sexual compulsions' and a few other options. What were the other four options?",
+            "answer": "sexual fixations, problematic sexual behaviors, sexual impulsivity, compulsive sexuality",
+            "question_date": "2024/04/01 (Mon) 09:00",
+            "haystack_session_ids": [],
+            "haystack_dates": [],
+            "haystack_sessions": [],
+            "answer_session_ids": [],
+        }
+        plan = analyze_question(instance)
+        prediction = (
+            "Besides \"sexual compulsions,\" the other four alternative terms suggested were:\n"
+            "1. sexual fixations\n"
+            "2. problematic sexual behaviors\n"
+            "3. sexual impulsivity\n"
+            "4. compulsive sexuality"
+        )
+        self.assertEqual(
+            postprocess_prediction(plan, prediction),
+            "sexual fixations, problematic sexual behaviors, sexual impulsivity, compulsive sexuality",
+        )
+
+    def test_postprocess_prediction_single_session_assistant_extracts_percent_value(self):
+        instance = {
+            "question_id": "q-assistant-percent",
+            "question_type": "single-session-assistant",
+            "question": "What was the average improvement in framerate when using the Hardware-Aware Modular Training (HAMT) agent in the 'To Adapt or Not to Adapt? Real-Time Adaptation for Semantic Segmentation' submission?",
+            "answer": "approximately 20%",
+            "question_date": "2024/04/01 (Mon) 09:00",
+            "haystack_session_ids": [],
+            "haystack_dates": [],
+            "haystack_sessions": [],
+            "answer_session_ids": [],
+        }
+        plan = analyze_question(instance)
+        prediction = (
+            "The average improvement in framerate when using the Hardware-Aware Modular Training (HAMT) agent "
+            "in the \"To Adapt or Not to Adapt? Real-Time Adaptation for Semantic Segmentation\" submission was approximately 20%."
+        )
+        self.assertEqual(postprocess_prediction(plan, prediction), "20%")
 
     def test_answerability_allows_global_timeline_backstop(self):
         plan = analyze_question(self.instance)
