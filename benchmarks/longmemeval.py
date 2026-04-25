@@ -3368,6 +3368,11 @@ def is_single_session_question(plan):
 def single_session_include_assistant_turns(plan, default=False):
     if plan.question_type == "single-session-assistant":
         return True
+    # Preference questions need every disambiguating detail the assistant
+    # echoed back ("you said your cat Luna sheds a lot ..."), since the
+    # judge rubric rewards naming specific entities verbatim.
+    if (plan.reasoning_kind or "").lower() == "preference":
+        return True
     return default
 
 
