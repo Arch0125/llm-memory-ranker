@@ -450,6 +450,26 @@ def _write_jsonl(path, rows):
             handle.write(json.dumps(row, ensure_ascii=True) + "\n")
 
 
+def _read_jsonl_dict(path, key="question_id"):
+    """Read a JSONL file and return {row[key]: row}. Empty dict if missing."""
+    out = {}
+    if not Path(path).exists():
+        return out
+    with open(path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            qid = row.get(key)
+            if qid:
+                out[qid] = row
+    return out
+
+
 if history_granularity not in {"turn", "session", "hybrid"}:
     raise ValueError("history_granularity must be 'turn', 'session', or 'hybrid'")
 if history_format not in {"nl", "json"}:
@@ -861,38 +881,163 @@ def _ingest_history_threadsafe(store, embedder, instance, lock):
 
 
 # ── Main execution: parallel or sequential ──────────────────────────────────
+# Resume support: if the predictions/details files already exist (from a prior
+# run that crashed mid-flight), load them as a cache and skip questions whose
+# prediction is already on disk. This keeps long, expensive runs (e.g. gpt-4o
+# at ~$20+ per pass) from losing work to transient network errors.
+_existing_predictions = _read_jsonl_dict(output_path)
+_existing_details = _read_jsonl_dict(details_path)
+# Only resume successful rows. Rows with an "error" field are placeholders
+# from a prior failed attempt and should be retried on the next run.
+_resumable = {
+    qid
+    for qid, row in _existing_predictions.items()
+    if qid in _existing_details and not row.get("error")
+}
+if _resumable:
+    print(
+        f"Resume: found {len(_resumable)} cached predictions in "
+        f"{output_path}; skipping those questions."
+    )
+    # Drop placeholder (errored) rows from the on-disk files so the retry
+    # writes don't create duplicate question_id entries. We rewrite the
+    # files containing only the successful rows; subsequent appends add
+    # the freshly-retried results.
+    _kept_pred = [_existing_predictions[qid] for qid in _resumable]
+    _kept_det = [_existing_details[qid] for qid in _resumable]
+    _write_jsonl(output_path, _kept_pred)
+    _write_jsonl(details_path, _kept_det)
+elif Path(output_path).exists():
+    # No usable cache (everything errored, or file is unreadable) — wipe so
+    # we start clean and don't append onto stale lines.
+    Path(output_path).write_text("", encoding="utf-8")
+    if Path(details_path).exists():
+        Path(details_path).write_text("", encoding="utf-8")
+
 prediction_rows = [None] * len(instances)
 detail_rows = [None] * len(instances)
-_completed = [0]
+for idx, inst in enumerate(instances):
+    qid = inst["question_id"]
+    if qid in _resumable:
+        prediction_rows[idx] = _existing_predictions[qid]
+        detail_rows[idx] = _existing_details[qid]
+
+_pending = [
+    (idx, inst)
+    for idx, inst in enumerate(instances)
+    if inst["question_id"] not in _resumable
+]
+_completed = [len(_resumable)]
+_failed = [0]
 _print_lock = threading.Lock()
+_disk_lock = threading.Lock()
+
+# Open append handles for incremental writes. Order in the on-disk file does
+# not matter — both the judge and summary aggregation key off question_id.
+_pred_handle = open(output_path, "a", encoding="utf-8", buffering=1)
+_det_handle = open(details_path, "a", encoding="utf-8", buffering=1)
+
+
+def _flush_row(prediction_row, detail_row):
+    line_pred = json.dumps(prediction_row, ensure_ascii=True) + "\n"
+    line_det = json.dumps(detail_row, ensure_ascii=True) + "\n"
+    with _disk_lock:
+        _pred_handle.write(line_pred)
+        _det_handle.write(line_det)
+
+
+def _placeholder_rows(idx, instance, error_message):
+    qid = instance["question_id"]
+    prediction_row = {
+        "question_id": qid,
+        "hypothesis": "",
+        "raw_hypothesis": "",
+        "error": error_message,
+    }
+    detail_row = {
+        "question_id": qid,
+        "qtype": instance.get("question_type", ""),
+        "is_abstention": qid.endswith("_abs"),
+        "exact_match": 0.0,
+        "contains_match": 0.0,
+        "token_f1": 0.0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "answerable": False,
+        "selected_memory_count": 0,
+        "selected_session_recall": 0.0,
+        "structured_event_count": 0,
+        "solver_resolved": False,
+        "solver_confidence": 0.0,
+        "error": error_message,
+    }
+    return prediction_row, detail_row
+
+
+def _safe_process_one(idx, instance):
+    """Wrap _process_one so a single failure doesn't kill the whole run."""
+    try:
+        return _process_one(idx, instance)
+    except Exception as exc:  # pragma: no cover - defensive
+        msg = f"{type(exc).__name__}: {exc}"
+        prediction_row, detail_row = _placeholder_rows(idx, instance, msg)
+        return idx, prediction_row, detail_row
+
 
 num_workers = max(1, parallel_workers)
-print(f"Processing {len(instances)} examples with {num_workers} parallel workers...")
+print(
+    f"Processing {len(_pending)} examples with {num_workers} parallel workers"
+    f" ({len(_resumable)} resumed from cache, {len(instances)} total)..."
+)
 
 if num_workers <= 1:
     # Sequential fallback
-    for idx, inst in enumerate(instances):
-        _, pred, det = _process_one(idx + 1, inst)
+    for idx, inst in _pending:
+        _, pred, det = _safe_process_one(idx + 1, inst)
         prediction_rows[idx] = pred
         detail_rows[idx] = det
-        if (idx + 1) % 10 == 0 or (idx + 1) == len(instances):
-            print(f"Processed {idx + 1}/{len(instances)} LongMemEval examples with OpenAI")
+        _flush_row(pred, det)
+        if pred.get("error"):
+            _failed[0] += 1
+        _completed[0] += 1
+        done = _completed[0]
+        if done % 10 == 0 or done == len(instances):
+            suffix = f" ({_failed[0]} failed)" if _failed[0] else ""
+            print(f"Processed {done}/{len(instances)} LongMemEval examples with OpenAI{suffix}")
 else:
     with ThreadPoolExecutor(max_workers=num_workers) as pool:
         futures = {
-            pool.submit(_process_one, idx + 1, inst): idx
-            for idx, inst in enumerate(instances)
+            pool.submit(_safe_process_one, idx + 1, inst): idx
+            for idx, inst in _pending
         }
         for future in as_completed(futures):
             idx = futures[future]
-            index_val, pred, det = future.result()
+            try:
+                index_val, pred, det = future.result()
+            except Exception as exc:  # pragma: no cover - defensive
+                pred, det = _placeholder_rows(idx, instances[idx], f"{type(exc).__name__}: {exc}")
             prediction_rows[idx] = pred
             detail_rows[idx] = det
+            _flush_row(pred, det)
             with _print_lock:
+                if pred.get("error"):
+                    _failed[0] += 1
                 _completed[0] += 1
                 done = _completed[0]
                 if done % 10 == 0 or done == len(instances):
-                    print(f"Processed {done}/{len(instances)} LongMemEval examples with OpenAI")
+                    suffix = f" ({_failed[0]} failed)" if _failed[0] else ""
+                    print(f"Processed {done}/{len(instances)} LongMemEval examples with OpenAI{suffix}")
+
+_pred_handle.close()
+_det_handle.close()
+if _failed[0]:
+    print(
+        f"WARNING: {_failed[0]}/{len(instances)} questions failed and were "
+        f"recorded with empty hypotheses. Re-run the same command to retry "
+        f"only those failures (resume will skip the {len(instances) - _failed[0]} "
+        f"successful ones)."
+    )
 
 summary = summarize_records(detail_rows)
 summary.update(

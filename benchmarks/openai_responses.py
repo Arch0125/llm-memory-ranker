@@ -81,13 +81,23 @@ def create_response(
         "Content-Type": "application/json",
     }
 
+    # Retryable HTTP status codes:
+    #   - 408 request timeout, 409 conflict, 425 too early, 429 rate limit
+    #   - 500/502/503/504 standard server errors
+    #   - 520-527, 530 Cloudflare-origin errors (transient; api.openai.com
+    #     sits behind Cloudflare and emits these during upstream blips)
+    retryable_status = {
+        408, 409, 425, 429,
+        500, 502, 503, 504,
+        520, 521, 522, 523, 524, 525, 526, 527, 530,
+    }
     last_error = None
     last_error_body = None
     with httpx.Client(timeout=timeout_seconds) as client:
         for attempt in range(max_retries + 1):
             try:
                 response = client.post(url, headers=headers, json=payload)
-                if response.status_code in {429, 500, 502, 503, 504} and attempt < max_retries:
+                if response.status_code in retryable_status and attempt < max_retries:
                     time.sleep(min(8.0, 0.75 * (2 ** attempt)))
                     continue
                 response.raise_for_status()
@@ -109,7 +119,7 @@ def create_response(
                 # Fail fast on non-retryable client errors (400/401/403/404/422)
                 # — retrying just hides the real bug and burns wall-clock time.
                 status = getattr(resp, "status_code", None)
-                if status is not None and status not in {408, 409, 425, 429, 500, 502, 503, 504}:
+                if status is not None and status not in retryable_status:
                     break
                 if attempt >= max_retries:
                     break
