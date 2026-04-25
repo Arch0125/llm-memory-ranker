@@ -470,6 +470,82 @@ class LongMemEvalAnalyzerTests(unittest.TestCase):
         self.assertEqual(plan.reasoning_kind, "factual")
 
 
+class LongMemEvalJudgeTests(unittest.TestCase):
+    def test_template_routing_per_question_type(self):
+        from benchmarks.longmemeval_judge import build_judge_prompt
+
+        common = {"question": "Q?", "answer": "A.", "response": "R."}
+        ssp = build_judge_prompt(
+            "single-session-preference", abstention=False, **common
+        )
+        ku = build_judge_prompt("knowledge-update", abstention=False, **common)
+        tr = build_judge_prompt("temporal-reasoning", abstention=False, **common)
+        ssu = build_judge_prompt("single-session-user", abstention=False, **common)
+        ssa = build_judge_prompt(
+            "single-session-assistant", abstention=False, **common
+        )
+        ms = build_judge_prompt("multi-session", abstention=False, **common)
+
+        self.assertIn("rubric for desired personalized response", ssp)
+        self.assertIn("Rubric:", ssp)
+        self.assertIn("updated answer is the required answer", ku)
+        self.assertIn("off-by-one errors", tr)
+        # SSU/SSA/MS share the default factual template.
+        self.assertEqual(ssu, ssa)
+        self.assertEqual(ssu, ms)
+        self.assertNotIn("rubric", ssu.lower())
+
+    def test_abstention_template_used_when_flagged(self):
+        from benchmarks.longmemeval_judge import (
+            build_judge_prompt,
+            is_abstention_question,
+        )
+
+        self.assertTrue(is_abstention_question("abc123_abs"))
+        self.assertFalse(is_abstention_question("abc123"))
+        prompt = build_judge_prompt(
+            "single-session-user",
+            question="Q?",
+            answer="explanation",
+            response="I do not know.",
+            abstention=True,
+        )
+        self.assertIn("unanswerable", prompt)
+        self.assertIn("Explanation:", prompt)
+
+    def test_unknown_question_type_raises(self):
+        from benchmarks.longmemeval_judge import build_judge_prompt
+
+        with self.assertRaises(ValueError):
+            build_judge_prompt("???", "Q", "A", "R", abstention=False)
+
+    def test_summarize_results_unweighted_overall(self):
+        from benchmarks.longmemeval_judge import summarize_results
+
+        rows = [
+            {"question_type": "single-session-user", "judge_label": True,
+             "abstention": False, "judge_input_tokens": 1, "judge_output_tokens": 1,
+             "judge_total_tokens": 2},
+            {"question_type": "single-session-user", "judge_label": False,
+             "abstention": False, "judge_input_tokens": 1, "judge_output_tokens": 1,
+             "judge_total_tokens": 2},
+            # SSU bucket -> 1/2 = 0.5
+            {"question_type": "knowledge-update", "judge_label": True,
+             "abstention": False, "judge_input_tokens": 1, "judge_output_tokens": 1,
+             "judge_total_tokens": 2},
+            # KU bucket -> 1/1 = 1.0
+        ]
+        summary = summarize_results(rows)
+        self.assertEqual(summary["examples"], 3)
+        # Unweighted mean of category accuracies (only 2 categories present)
+        # = mean(0.5, 1.0) = 0.75; micro = 2/3 = 0.6667.
+        self.assertAlmostEqual(summary["judge_accuracy"], 0.75, places=4)
+        self.assertAlmostEqual(summary["judge_accuracy_micro"], 2 / 3, places=4)
+        ssu = summary["by_question_type"]["single-session-user"]
+        self.assertEqual(ssu["examples"], 2)
+        self.assertAlmostEqual(ssu["judge_accuracy"], 0.5, places=4)
+
+
 class BM25Tests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

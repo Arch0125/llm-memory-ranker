@@ -43,10 +43,19 @@ run_retrieval_logs = True
 # dir's summaries. Conditions missing in the candidate fall back to the
 # baseline dir's value.
 baseline_reports_dir = ""
-# One of {exact_match, contains_match, token_f1}. contains_match is the closest
-# local proxy for LLM-as-Judge accuracy.
+# One of {exact_match, contains_match, token_f1, judge_accuracy}.
+# contains_match is the cheap local proxy; judge_accuracy reads the
+# LongMemEval LLM-judge summary that mirrors the official evaluate_qa.py
+# scoring (Supermemory / Mastra OM / Hindsight all report this metric).
 table_metric = "contains_match"
 print_table = True
+# When non-empty, after each condition's predictions are produced the protocol
+# also runs the LongMemEval LLM-judge (benchmarks.longmemeval_judge) using this
+# model. Recommended: ``gpt-4o`` for headline-comparable numbers; ``gpt-4o-mini``
+# for cheap iteration.
+judge_model = ""
+judge_dataset = ""  # optional; defaults to oracle_dataset if empty
+judge_workers = 8
 # Forwarded to benchmark_longmemeval_openai.py for the s_memory condition.
 memory_fusion_strategy = "weighted"
 memory_use_bm25 = False
@@ -271,6 +280,39 @@ def _load_summary(path):
         return json.load(handle)
 
 
+def _judge_paths_for(label):
+    return (
+        str(_reports_path(f"{label}_judge.jsonl")),
+        str(_reports_path(f"{label}_judge_summary.json")),
+    )
+
+
+def _run_judge_for(condition):
+    """Run benchmarks.longmemeval_judge against ``condition``'s predictions."""
+    output_path, summary_path = _judge_paths_for(condition["label"])
+    dataset_path = judge_dataset or _dataset_path(oracle_dataset)
+    args = [
+        "-m",
+        "benchmarks.longmemeval_judge",
+        f"--predictions={condition['output_path']}",
+        f"--dataset={dataset_path}",
+        f"--output={output_path}",
+        f"--summary={summary_path}",
+        f"--judge_model={judge_model}",
+        f"--judge_workers={judge_workers}",
+    ]
+    cmd = _run_python(args, cwd=str(ROOT))
+    return {
+        "judge_model": judge_model,
+        "judge_predictions_path": condition["output_path"],
+        "judge_dataset_path": dataset_path,
+        "judge_output_path": output_path,
+        "judge_summary_path": summary_path,
+        "judge_summary": _load_summary(summary_path),
+        "judge_command": cmd,
+    }
+
+
 def _print_delta(memory_summary, baseline_summary):
     print("Comparison: S + memory vs S full-history baseline")
     for key in ("exact_match", "token_f1", "contains_match"):
@@ -311,6 +353,8 @@ for name in conditions:
     condition["summary"] = _load_summary(condition["summary_path"])
     if official_repo_path:
         condition.update(_run_official_eval(condition))
+    if judge_model:
+        condition.update(_run_judge_for(condition))
     manifest["conditions"].append(condition)
 
 if "s_memory" in conditions and run_retrieval_logs:
@@ -345,13 +389,21 @@ if print_table:
         else None
     )
 
+    is_judge_metric = table_metric == "judge_accuracy"
+
     def _summary_for(label):
-        """Resolve a condition summary, preferring candidate, falling back to baseline."""
-        cand = candidate_dir / f"{label}_summary.json"
+        """Resolve a condition summary, preferring candidate, falling back to baseline.
+
+        For ``table_metric == judge_accuracy`` we look for the ``*_judge_summary.json``
+        file (produced by benchmarks.longmemeval_judge) instead of the regular
+        per-run summary.
+        """
+        suffix = "_judge_summary.json" if is_judge_metric else "_summary.json"
+        cand = candidate_dir / f"{label}{suffix}"
         if cand.exists():
             return str(cand), False
         if baseline_dir is not None:
-            base = baseline_dir / f"{label}_summary.json"
+            base = baseline_dir / f"{label}{suffix}"
             if base.exists():
                 return str(base), True
         return "", False

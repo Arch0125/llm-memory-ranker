@@ -129,6 +129,37 @@ If you already have a local checkout of the official LongMemEval repo, you can a
 
 When `--official_repo_path` is set, the script looks for `evaluate_qa.py` and `print_qa_metrics.py` under that repo and writes the official evaluator output into `reports/longmemeval_protocol/*_official_*.txt`.
 
+### LLM-as-judge (LongMemEval-style scoring)
+
+For headline-comparable numbers against published systems (Supermemory, Mastra OM, Hindsight, Zep), run the LongMemEval LLM-judge. This mirrors the official `evaluate_qa.py` exactly: per-question-type prompt templates, `gpt-4o` as the default judge, binary correct/incorrect, overall accuracy = unweighted mean across the six categories.
+
+Pass `--judge_model=...` to the protocol runner:
+
+```sh
+./venv/bin/python run_longmemeval_protocol.py \
+  --openai_model=gpt-4o-mini \
+  --reports_dir=reports/longmemeval_full_v3_pref_yesno \
+  --baseline_reports_dir=reports/longmemeval_full_v1 \
+  --run_conditions=s_memory \
+  --run_retrieval_logs=False \
+  --judge_model=gpt-4o \
+  --table_metric=judge_accuracy
+```
+
+The protocol runner spawns `benchmarks.longmemeval_judge` after each condition, writes `<condition>_judge.jsonl` and `<condition>_judge_summary.json`, and prints the leaderboard using judge accuracy. Or call the grader directly on an already-completed run:
+
+```sh
+./venv/bin/python -m benchmarks.longmemeval_judge \
+  --predictions=reports/longmemeval_full_v3_pref_yesno/s_memory_predictions.jsonl \
+  --dataset=data/longmemeval_oracle.json \
+  --output=reports/longmemeval_full_v3_pref_yesno/s_memory_judge.jsonl \
+  --summary=reports/longmemeval_full_v3_pref_yesno/s_memory_judge_summary.json \
+  --judge_model=gpt-4o \
+  --judge_workers=8
+```
+
+Estimated cost on full LongMemEval-S (500 questions): ~\$0.20 with `gpt-4o`, ~\$0.01 with `gpt-4o-mini`. The cheap local proxies (`contains_match`, `exact_match`, `token_f1`) remain available for fast iteration.
+
 It also runs the official retrieval metric printer `print_retrieval_metrics.py` on the generated retrieval logs, so you get both:
 
 - official QA evaluation on `jsonl` predictions

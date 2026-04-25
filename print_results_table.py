@@ -144,8 +144,12 @@ def main():
     parser.add_argument(
         "--metric",
         default="contains_match",
-        choices=["exact_match", "contains_match", "token_f1"],
-        help="Which metric to report in the table cells. Default: contains_match.",
+        choices=["exact_match", "contains_match", "token_f1", "judge_accuracy"],
+        help=(
+            "Which metric to report in the table cells. Default: contains_match. "
+            "judge_accuracy reads from a LongMemEval LLM-judge summary "
+            "(produced by benchmarks.longmemeval_judge)."
+        ),
     )
     parser.add_argument(
         "--baseline-index",
