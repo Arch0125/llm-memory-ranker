@@ -4521,15 +4521,24 @@ def build_benchmark_instructions(plan, selected_hits, answerability, base_system
         parts.append("The evidence table is sufficient. Answer directly and do NOT reply with 'Insufficient evidence'.")
     else:
         parts.append("Try to answer from the evidence table. Only reply 'Insufficient evidence' if the evidence contains absolutely no relevant information.")
+    from memory.prompting import final_answer_instruction
+
+    parts.append(final_answer_instruction())
     parts.append(build_evidence_table(plan, selected_hits, structured_events=structured_events))
     return "\n\n".join(parts)
 
 
 def postprocess_prediction(plan, text):
+    from memory.postprocess import extract_final_answer_marker
+
     raw_text = _coerce_text(text)
     value = _collapse(text)
     if not value:
         return value
+    final_answer = extract_final_answer_marker(raw_text)
+    if final_answer:
+        raw_text = final_answer
+        value = _collapse(final_answer)
     lowered_value = value.lower()
     has_abstention_marker = any(
         marker in lowered_value

@@ -29,6 +29,7 @@ from ..granularity import (
     build_global_timeline_memory,
     build_timeline_memory,
 )
+from ..postprocess import extract_final_answer_marker
 from ..query import QueryPlan
 from ..utils import extract_entities, normalize_entity, tokenize
 from .base import BenchmarkAdapter, BenchmarkInstance, register_adapter
@@ -226,6 +227,10 @@ class LoCoMoAdapter:
         text = (raw_text or "").strip()
         if not text:
             return ""
+        # Prefer the canonical "Final answer:" marker when the model emits it.
+        marker = extract_final_answer_marker(text)
+        if marker:
+            return marker
         first_line = text.split("\n", 1)[0].strip()
         if first_line.lower().startswith("answer:"):
             first_line = first_line[len("answer:"):].strip()

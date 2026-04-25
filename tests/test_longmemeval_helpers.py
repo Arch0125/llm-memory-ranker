@@ -772,6 +772,63 @@ class LongMemEvalHelpersTest(unittest.TestCase):
         prediction = "You attended the Data Analysis using Python webinar first on 2024/01/01."
         self.assertEqual(postprocess_prediction(plan, prediction), "Data Analysis using Python")
 
+    def test_postprocess_prediction_uses_final_answer_marker_for_factual_question(self):
+        instance = {
+            "question_id": "q-fact-1",
+            "question_type": "single-session-user",
+            "question": "What degree did I graduate with?",
+            "answer": "Business Administration",
+            "question_date": "2024/01/10 (Wed) 10:00",
+            "haystack_session_ids": [],
+            "haystack_dates": [],
+            "haystack_sessions": [],
+            "answer_session_ids": [],
+        }
+        plan = analyze_question(instance)
+        prediction = (
+            "You graduated with a degree in Business Administration based on the chat.\n"
+            "Final answer: Business Administration"
+        )
+        self.assertEqual(postprocess_prediction(plan, prediction), "Business Administration")
+
+    def test_postprocess_prediction_strips_quotes_from_final_answer(self):
+        instance = {
+            "question_id": "q-fact-2",
+            "question_type": "single-session-user",
+            "question": "What is the name of the playlist I created on Spotify?",
+            "answer": "Summer Vibes",
+            "question_date": "2024/01/10 (Wed) 10:00",
+            "haystack_session_ids": [],
+            "haystack_dates": [],
+            "haystack_sessions": [],
+            "answer_session_ids": [],
+        }
+        plan = analyze_question(instance)
+        prediction = (
+            "The playlist is called \"Summer Vibes\".\n"
+            "Final answer: \"Summer Vibes\""
+        )
+        self.assertEqual(postprocess_prediction(plan, prediction), "Summer Vibes")
+
+    def test_postprocess_prediction_takes_last_final_answer_when_repeated(self):
+        instance = {
+            "question_id": "q-fact-3",
+            "question_type": "single-session-user",
+            "question": "How much did I spend?",
+            "answer": "$800",
+            "question_date": "2024/01/10 (Wed) 10:00",
+            "haystack_session_ids": [],
+            "haystack_dates": [],
+            "haystack_sessions": [],
+            "answer_session_ids": [],
+        }
+        plan = analyze_question(instance)
+        prediction = (
+            "Initial guess.\nFinal answer: $700\n"
+            "Wait, re-reading.\nFinal answer: $800"
+        )
+        self.assertEqual(postprocess_prediction(plan, prediction), "$800")
+
     def test_postprocess_prediction_extracts_target_with_internal_article(self):
         instance = {
             "question_id": "q4",
