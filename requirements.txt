@@ -1,0 +1,9 @@
+# Core runtime dependencies for the memory engine + benchmarks.
+numpy>=1.26
+httpx>=0.27
+rank-bm25>=0.2.2
+
+# Optional dependencies (install on demand):
+#   sentence-transformers   stronger embeddings + cross-encoder reranker
+#   faiss-cpu               ANN vector index for memory.index.FaissFlatIndex
+#   torch                   transitively required by sentence-transformers

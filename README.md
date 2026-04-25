@@ -10,8 +10,12 @@ The core memory system leaves the generator unchanged. It stores hybrid benchmar
 ## Layout
 
 - `memory/`: memory store, embeddings, retrieval, critic, policies, explainability
-- `prompt/`: prompt assembly and budget selection
+  - `memory/adapters/`: pluggable benchmark adapters (`longmemeval`, `locomo`, `memorybench`)
+  - `memory/{query,extractors,granularity,evidence,solver}.py`: benchmark-agnostic primitives
+  - `memory/{fusion,bm25,expansion,selection,rerank,cache,index}.py`: retrieval upgrades
+- `prompt/`: prompt assembly and budget selection (now MMR-aware)
 - `memory_cli.py`: inspect and manage local memories
+- `run_benchmark.py`: benchmark-agnostic runner (retrieval + deterministic solver, no LLM)
 - `benchmark_longmemeval_openai.py`: run the same benchmark with OpenAI as the generator
 - `benchmark_longmemeval_retrieval.py`: emit an official-style LongMemEval retrieval log for the local memory retriever
 - `run_longmemeval_protocol.py`: run a comparable LongMemEval protocol across `S full-history`, `S + memory`, and `Oracle upper bound`
@@ -184,3 +188,86 @@ curl -L https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/m
 ```
 
 For quick validation, `longmemeval_oracle.json` is the easiest starting point because it contains only the evidence sessions. For harder retrieval stress tests, use `longmemeval_s_cleaned.json` or `longmemeval_m_cleaned.json` with the same OpenAI runner.
+
+## Generic Memory Engine
+
+The memory layer now exposes a benchmark-agnostic API so the same engine can run across LongMemEval, LoCoMo, MemoryBench, or your own dataset.
+
+### Adapter API
+
+Every benchmark plugs in via a `BenchmarkAdapter` (see `memory/adapters/base.py`):
+
+```python
+from memory.adapters import get_adapter
+
+adapter = get_adapter("longmemeval")           # or "locomo" / "memorybench"
+instances = adapter.load("data/longmemeval_oracle.json")
+instances = adapter.filter(instances, max_examples=20)
+for instance in instances:
+    plan = adapter.analyze(instance)            # generic QueryPlan
+    for memory in adapter.ingest(instance):     # generic memory dicts
+        ...
+    prediction = adapter.postprocess(plan, raw_text)
+    metrics = adapter.score(plan, prediction, instance)
+```
+
+Three adapters ship in-tree:
+
+- **`longmemeval`** – wraps the existing harness with no behaviour change.
+- **`locomo`** – LoCoMo conversation/qa records (sessions + per-question gold).
+- **`memorybench`** – generic JSON/JSONL adapter for "bring your own dataset".
+
+Add new adapters by subclassing the protocol and registering with `@register_adapter("name")`.
+
+### Retrieval improvements
+
+`MemoryAwareConfig` now carries opt-in flags for the new retrieval stack:
+
+| Flag | Default | Effect |
+|---|---|---|
+| `fusion_strategy` | `"weighted"` | `"rrf"` switches hybrid retrieval to Reciprocal Rank Fusion |
+| `use_bm25` | `False` | Replace the hand-rolled keyword scorer with `rank_bm25` BM25Okapi |
+| `use_query_expansion` | `False` | Issue entity-only and reformulation sub-queries, fuse via RRF |
+| `keyword_weight` | `0.35` | Influence of the keyword stream during fusion |
+| `diversity` | `0.0` | MMR strength in budget selection (0 = disabled) |
+| `use_embedding_cache` | `True` | Cache embeddings keyed by `(model, sha1(text))` |
+| `rerank_top_k` | `0` | When `>0`, run a cross-encoder reranker over the top hits |
+| `rerank_blend` | `0.7` | Blend of cross-encoder vs. input-rank scores |
+
+Recommended starting point for general-purpose use:
+
+```python
+config = MemoryAwareConfig(
+    fusion_strategy="rrf",
+    use_bm25=True,
+    use_query_expansion=True,
+    diversity=0.3,
+    rerank_top_k=20,           # only if sentence-transformers is installed
+)
+```
+
+### Generic runner
+
+A benchmark-agnostic runner exercises the engine end-to-end without calling any LLM:
+
+```sh
+./venv/bin/python run_benchmark.py \
+  --benchmark=longmemeval \
+  --data=data/longmemeval_oracle.json \
+  --max=20 \
+  --fusion=rrf \
+  --query-expansion --bm25 --diversity=0.3
+```
+
+It writes a JSONL of per-example results (retrieval recall + deterministic solver answers) and prints summary metrics. Useful for iterating on retrieval quality without spending API credits.
+
+### Optional dependencies
+
+| Package | Enables |
+|---|---|
+| `sentence-transformers` | Stronger embeddings + cross-encoder reranker |
+| `rank-bm25` | Proper Okapi BM25 keyword scoring |
+| `faiss-cpu` | ANN vector index in `memory.index.FaissFlatIndex` |
+| `numpy` | Required by the upgraded fusion / index / MMR code |
+
+Everything degrades gracefully when an optional dependency is missing.

@@ -63,47 +63,95 @@ def retrieve_hybrid_candidates(
     top_k=20,
     type_allowlist=None,
     keyword_weight=0.35,
+    fusion="weighted",
+    use_bm25=False,
 ):
-    """Retrieve candidates using both embedding similarity and keyword overlap.
+    """Retrieve candidates using embeddings and keyword/BM25, then fuse.
 
-    Merges results from embedding search and keyword search, combining scores
-    for memories found by both methods.  This catches memories with matching
-    keywords that hash embeddings might rank low.
+    `fusion` selects the merge strategy:
+        - "rrf"      -> Reciprocal Rank Fusion (recommended, scale-free).
+        - "weighted" -> classic weighted-sum (kept for back-compat).
     """
+    from .bm25 import bm25_search
+    from .fusion import reciprocal_rank_fusion, weighted_score_fusion
+
     embedding_hits = retrieve_candidates(
         query_text, store, embedder, user_id, top_k=top_k, type_allowlist=type_allowlist,
     )
-    keyword_hits = store.keyword_search(
-        query_text, user_id, top_k=top_k, type_allowlist=type_allowlist,
+    if use_bm25:
+        keyword_hits = bm25_search(
+            store, query_text, user_id, top_k=top_k, type_allowlist=type_allowlist,
+        )
+    else:
+        keyword_hits = store.keyword_search(
+            query_text, user_id, top_k=top_k, type_allowlist=type_allowlist,
+        )
+
+    if fusion == "rrf":
+        return reciprocal_rank_fusion(
+            [embedding_hits, keyword_hits],
+            weights=[1.0, max(keyword_weight * 2.0, 0.5)],
+            top_k=top_k,
+        )
+    return weighted_score_fusion(
+        [embedding_hits, keyword_hits],
+        weights=[1.0 - keyword_weight, keyword_weight],
+        top_k=top_k,
     )
 
-    # Merge: index by memory_id, combine scores
-    merged = {}
-    for hit in embedding_hits:
-        merged[hit.record.memory_id] = hit
 
-    embedding_weight = 1.0 - keyword_weight
-    for kw_hit in keyword_hits:
-        mid = kw_hit.record.memory_id
-        if mid in merged:
-            # Blend: keep the embedding hit but boost its score with keyword score
-            existing = merged[mid]
-            existing.score = (
-                embedding_weight * existing.score
-                + keyword_weight * kw_hit.score
+def retrieve_for_query(
+    query_text,
+    store,
+    embedder,
+    user_id,
+    *,
+    top_k=20,
+    type_allowlist=None,
+    expansions=None,
+    fusion="rrf",
+    use_bm25=True,
+    keyword_weight=0.5,
+):
+    """Top-level retrieval helper that combines query expansion + hybrid fusion.
+
+    `expansions` is a list of additional query strings to retrieve in parallel
+    (typically produced by `memory.expansion.expand_query`). All ranked lists
+    are merged via `fusion` ("rrf" or "weighted"). The original query is
+    always retrieved first.
+    """
+    from .bm25 import bm25_search
+    from .fusion import reciprocal_rank_fusion, weighted_score_fusion
+
+    queries = [query_text]
+    if expansions:
+        for q in expansions:
+            if q and q not in queries:
+                queries.append(q)
+
+    ranked_lists = []
+    weights = []
+    for index, q in enumerate(queries):
+        # Per-query weight decays so the original query has the largest signal.
+        per_query_weight = 1.0 if index == 0 else max(0.6, 1.0 - 0.15 * index)
+        ranked_lists.append(
+            retrieve_candidates(q, store, embedder, user_id, top_k=top_k, type_allowlist=type_allowlist)
+        )
+        weights.append(per_query_weight)
+        if use_bm25:
+            ranked_lists.append(
+                bm25_search(store, q, user_id, top_k=top_k, type_allowlist=type_allowlist)
             )
-            if not existing.reasons:
-                existing.reasons = []
-            existing.reasons.append(f"kw-boost={kw_hit.score:.2f}")
+            weights.append(per_query_weight * keyword_weight * 2.0)
         else:
-            # New hit from keyword search only - scale its score
-            kw_hit.score = keyword_weight * kw_hit.score
-            kw_hit.reasons = [f"keyword-only={kw_hit.score:.2f}"]
-            merged[mid] = kw_hit
+            ranked_lists.append(
+                store.keyword_search(q, user_id, top_k=top_k, type_allowlist=type_allowlist)
+            )
+            weights.append(per_query_weight * keyword_weight)
 
-    all_hits = list(merged.values())
-    all_hits.sort(key=lambda h: h.score, reverse=True)
-    return all_hits[:top_k]
+    if fusion == "rrf":
+        return reciprocal_rank_fusion(ranked_lists, weights=weights, top_k=top_k)
+    return weighted_score_fusion(ranked_lists, weights=weights, top_k=top_k)
 
 
 def gate_hits(
