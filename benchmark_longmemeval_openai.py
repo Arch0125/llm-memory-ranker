@@ -91,6 +91,8 @@ memory_keyword_weight = 0.35
 memory_diversity = 0.0
 memory_rerank_top_k = 0
 memory_rerank_blend = 0.7
+memory_recency_bias = 0.0
+memory_recency_bias_kinds = "knowledge-update"
 reader_context_mode = "auto"
 history_format = "nl"
 openai_api_key = ""
@@ -281,6 +283,12 @@ def _make_memory_system(store, embedder, policy):
             diversity=memory_diversity,
             rerank_top_k=memory_rerank_top_k,
             rerank_blend=memory_rerank_blend,
+            recency_bias=memory_recency_bias,
+            recency_bias_kinds=[
+                kind.strip()
+                for kind in (memory_recency_bias_kinds or "").split(",")
+                if kind.strip()
+            ] or ["knowledge-update"],
         ),
     )
 

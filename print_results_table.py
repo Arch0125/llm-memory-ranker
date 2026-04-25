@@ -37,7 +37,8 @@ CATEGORY_LABELS = [abbr for _, abbr in CATEGORY_ORDER]
 COLUMNS = CATEGORY_LABELS + ["Overall"]
 
 
-def _load(path: str):
+def load_summary(path):
+    """Load a LongMemEval summary JSON; return None if missing."""
     p = Path(path)
     if not p.exists():
         print(f"warning: {path} does not exist; skipping", file=sys.stderr)
@@ -46,7 +47,7 @@ def _load(path: str):
         return json.load(fh)
 
 
-def _row_values(summary, metric: str):
+def row_values(summary, metric: str):
     """Return [SSU, SSA, SSP, KU, TR, MS, Overall] floats (or None)."""
     if not summary:
         return [None] * len(COLUMNS)
@@ -71,7 +72,28 @@ def _fmt_pct(value, *, sign=False):
     return f"{pct:.2f}%"
 
 
-def _render(rows, baseline_index: int | None, *, label_width: int, col_width: int):
+def render_table(rows, *, baseline_index=None, label_width=None, col_width=None):
+    """Render a leaderboard-style table.
+
+    Parameters
+    ----------
+    rows : list[(label, values)]
+        ``values`` must be a list aligned to :data:`COLUMNS`.
+    baseline_index : int | None
+        If given (and at least 2 rows exist), appends a trailing "Delta"
+        row comparing the *last* row to ``rows[baseline_index]``.
+    """
+    if label_width is None:
+        label_width = max(len(label) for label, _ in rows) if rows else 0
+        if baseline_index is not None and len(rows) >= 2:
+            label_width = max(
+                label_width,
+                len(f"Delta ({rows[-1][0]} vs {rows[baseline_index][0]})"),
+            )
+        label_width = max(label_width, len("Categories"))
+    if col_width is None:
+        col_width = max(8, max(len(c) for c in COLUMNS))
+
     header = "| " + "Categories".ljust(label_width) + " |"
     for col in COLUMNS:
         header += " " + col.center(col_width) + " |"
@@ -91,10 +113,7 @@ def _render(rows, baseline_index: int | None, *, label_width: int, col_width: in
         last_label, last_vals = rows[-1]
         deltas = []
         for a, b in zip(baseline_vals, last_vals):
-            if a is None or b is None:
-                deltas.append(None)
-            else:
-                deltas.append(b - a)
+            deltas.append(None if (a is None or b is None) else b - a)
         delta_label = f"Delta ({last_label} vs {baseline_label})"
         line = "| " + delta_label.ljust(label_width) + " |"
         for d in deltas:
@@ -103,6 +122,16 @@ def _render(rows, baseline_index: int | None, *, label_width: int, col_width: in
         lines.append(line)
 
     return "\n".join(lines)
+
+
+def build_rows(label_to_path, metric: str):
+    """Convenience: given an iterable of (label, summary_path) pairs, return
+    [(label, row_values(...))] suitable for :func:`render_table`."""
+    rows = []
+    for label, path in label_to_path:
+        summary = load_summary(path) if path else None
+        rows.append((label, row_values(summary, metric)))
+    return rows
 
 
 def main():
@@ -131,36 +160,20 @@ def main():
     )
     args = parser.parse_args()
 
-    parsed = []
+    pairs = []
     for raw in args.rows:
         if "=" not in raw:
             print(f"error: expected LABEL=PATH, got {raw!r}", file=sys.stderr)
             sys.exit(2)
         label, _, path = raw.partition("=")
-        summary = _load(path)
-        values = _row_values(summary, args.metric)
-        parsed.append((label.strip(), values))
+        pairs.append((label.strip(), path))
 
-    if not parsed:
+    if not pairs:
         sys.exit(1)
 
-    label_width = max(len(label) for label, _ in parsed)
-    if not args.no_delta and len(parsed) >= 2:
-        baseline_label = parsed[args.baseline_index][0]
-        last_label = parsed[-1][0]
-        delta_label = f"Delta ({last_label} vs {baseline_label})"
-        label_width = max(label_width, len(delta_label))
-    label_width = max(label_width, len("Categories"))
-    col_width = max(8, max(len(c) for c in COLUMNS))
-
+    rows = build_rows(pairs, args.metric)
     print(f"Metric: {args.metric}\n")
-    table = _render(
-        parsed,
-        baseline_index=None if args.no_delta else args.baseline_index,
-        label_width=label_width,
-        col_width=col_width,
-    )
-    print(table)
+    print(render_table(rows, baseline_index=None if args.no_delta else args.baseline_index))
 
 
 if __name__ == "__main__":

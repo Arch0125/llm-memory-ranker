@@ -38,12 +38,23 @@ question_types = ""
 # Set to False to skip the post-hoc retrieval-log passes (session + turn) — they
 # add ~30-60s and are diagnostic-only.
 run_retrieval_logs = True
+# When set, after this run finishes the script prints a Supermemory-style
+# leaderboard table comparing the candidate (this run) against the baseline
+# dir's summaries. Conditions missing in the candidate fall back to the
+# baseline dir's value.
+baseline_reports_dir = ""
+# One of {exact_match, contains_match, token_f1}. contains_match is the closest
+# local proxy for LLM-as-Judge accuracy.
+table_metric = "contains_match"
+print_table = True
 # Forwarded to benchmark_longmemeval_openai.py for the s_memory condition.
 memory_fusion_strategy = "weighted"
 memory_use_bm25 = False
 memory_use_query_expansion = False
 memory_diversity = 0.0
 memory_rerank_top_k = 0
+memory_recency_bias = 0.0
+memory_recency_bias_kinds = "knowledge-update"
 apply_argv_overrides(globals())
 question_types = normalize_question_types(question_types)
 
@@ -117,6 +128,8 @@ def _run_condition(label, dataset_path, memory_enabled, reader_context_mode):
             f"--memory_use_query_expansion={memory_use_query_expansion}",
             f"--memory_diversity={memory_diversity}",
             f"--memory_rerank_top_k={memory_rerank_top_k}",
+            f"--memory_recency_bias={memory_recency_bias}",
+            f"--memory_recency_bias_kinds={memory_recency_bias_kinds}",
         ])
 
     cmd = _run_python(args, cwd=str(ROOT))
@@ -320,3 +333,66 @@ print(f"Wrote protocol manifest to {manifest_path}")
 by_label = {item["label"]: item for item in manifest["conditions"]}
 if "s_memory" in by_label and "s_full_history" in by_label:
     _print_delta(by_label["s_memory"]["summary"], by_label["s_full_history"]["summary"])
+
+
+if print_table:
+    from print_results_table import build_rows, render_table
+
+    candidate_dir = (ROOT / reports_dir).resolve()
+    baseline_dir = (
+        (ROOT / baseline_reports_dir).resolve()
+        if baseline_reports_dir
+        else None
+    )
+
+    def _summary_for(label):
+        """Resolve a condition summary, preferring candidate, falling back to baseline."""
+        cand = candidate_dir / f"{label}_summary.json"
+        if cand.exists():
+            return str(cand), False
+        if baseline_dir is not None:
+            base = baseline_dir / f"{label}_summary.json"
+            if base.exists():
+                return str(base), True
+        return "", False
+
+    table_pairs = []
+    suffix_model = f" ({openai_model})"
+    config_tag = []
+    if memory_fusion_strategy and memory_fusion_strategy != "weighted":
+        config_tag.append(memory_fusion_strategy)
+    if memory_use_bm25:
+        config_tag.append("bm25")
+    if memory_use_query_expansion:
+        config_tag.append("expand")
+    if memory_diversity:
+        config_tag.append(f"div={memory_diversity}")
+    if memory_rerank_top_k:
+        config_tag.append(f"rerank={memory_rerank_top_k}")
+    if memory_recency_bias:
+        config_tag.append(f"recency={memory_recency_bias}")
+    memory_label_suffix = f" ({'+'.join(config_tag)})" if config_tag else ""
+
+    # Order: full-history first (so it can serve as the Delta baseline), then
+    # oracle, then memory last (so the trailing Delta row compares memory layer
+    # vs full-history).
+    label_map = [
+        ("s_full_history", f"Full-history{suffix_model}"),
+        ("oracle_upper_bound", f"Oracle upper bound{suffix_model}"),
+        ("s_memory", f"Memory layer{suffix_model}{memory_label_suffix}"),
+    ]
+    for cond, display in label_map:
+        path, reused = _summary_for(cond)
+        if not path:
+            continue
+        label = display + ("  (reused)" if reused else "")
+        table_pairs.append((label, path))
+
+    if table_pairs:
+        baseline_index = next(
+            (i for i, (label, _) in enumerate(table_pairs) if label.startswith("Full-history")),
+            None,
+        )
+        rows = build_rows(table_pairs, table_metric)
+        print(f"\nLeaderboard ({table_metric}):\n")
+        print(render_table(rows, baseline_index=baseline_index))

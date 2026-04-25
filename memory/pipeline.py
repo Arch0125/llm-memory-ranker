@@ -5,6 +5,7 @@ from memory.cache import CachedEmbedder, InMemoryEmbeddingCache
 from memory.critic import HeuristicCritic, rerank_with_critic
 from memory.expansion import expand_query
 from memory.explain import build_trace
+from memory.recency import apply_recency_bias
 from memory.rerank import null_reranker
 from memory.retrieve import (
     gate_hits,
@@ -41,6 +42,14 @@ class MemoryAwareConfig:
     use_embedding_cache: bool = True
     rerank_top_k: int = 0                  # 0 disables cross-encoder rerank
     rerank_blend: float = 0.7
+
+    # Recency bias: post-fusion multiplicative bonus to the most-recent dated
+    # memories. 0 disables. Triggered only for plans whose reasoning_kind /
+    # question_type matches `recency_bias_kinds`. Generic across benchmarks.
+    recency_bias: float = 0.0
+    recency_bias_kinds: list[str] = field(
+        default_factory=lambda: ["knowledge-update"]
+    )
 
     # Optional benchmark-level state, not used by the core but threaded by
     # adapters wanting to pass per-query plans through to a reranker etc.
@@ -128,6 +137,14 @@ class MemoryAwareInference:
             max_age_days=self.config.max_age_days,
             stable_importance_threshold=self.config.stable_importance_threshold,
         )
+
+        if self.config.recency_bias > 0 and plan is not None:
+            apply_recency_bias(
+                gated,
+                strength=self.config.recency_bias,
+                plan=plan,
+                trigger_kinds=self.config.recency_bias_kinds,
+            )
 
         if self.config.rerank_top_k and getattr(self.reranker, "available", False):
             gated = self.reranker.rerank(

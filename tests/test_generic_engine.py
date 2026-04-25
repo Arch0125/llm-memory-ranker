@@ -36,6 +36,7 @@ from memory.granularity import (
     build_global_timeline_memory,
     build_timeline_memory,
 )
+from memory.recency import apply_recency_bias
 from memory.solver import solve
 from memory.types import MemoryHit, MemoryRecord
 
@@ -259,6 +260,45 @@ class PipelineUpgradeTests(unittest.TestCase):
         ranked = self.memory.rank_hits(plan.query_text, plan=plan)
         kinds = [hit.record.memory_type for hit in ranked]
         self.assertIn("project", kinds)
+
+
+class RecencyBiasTests(unittest.TestCase):
+    def _ku_plan(self):
+        return QueryPlan(
+            question="What is my current job title?",
+            query_text="What is my current job title?",
+            reasoning_kind="knowledge-update",
+            question_type="knowledge-update",
+        )
+
+    def test_promotes_newer_memory_when_plan_matches(self):
+        old = _hit("old", 0.80, text="Senior Engineer", event_date="2024-01-01")
+        new = _hit("new", 0.78, text="Staff Engineer", event_date="2024-12-01")
+        result = apply_recency_bias([old, new], strength=0.4, plan=self._ku_plan())
+        self.assertEqual(result[0].record.memory_id, "new")
+        # Older memory's score is left unchanged.
+        self.assertAlmostEqual(old.score, 0.80, places=6)
+        self.assertGreater(new.score, 0.78)
+
+    def test_no_op_when_plan_kind_not_in_trigger_set(self):
+        old = _hit("old", 0.80, text="A", event_date="2024-01-01")
+        new = _hit("new", 0.78, text="B", event_date="2024-12-01")
+        plan = QueryPlan(
+            question="What did Alice say?",
+            query_text="What did Alice say?",
+            reasoning_kind="factual",
+            question_type="single-session-user",
+        )
+        apply_recency_bias([old, new], strength=0.4, plan=plan)
+        self.assertEqual(old.score, 0.80)
+        self.assertEqual(new.score, 0.78)
+
+    def test_no_op_when_no_dated_memories(self):
+        a = _hit("a", 0.80)
+        b = _hit("b", 0.78)
+        apply_recency_bias([a, b], strength=0.5, plan=self._ku_plan())
+        self.assertEqual(a.score, 0.80)
+        self.assertEqual(b.score, 0.78)
 
 
 class BM25Tests(unittest.TestCase):
