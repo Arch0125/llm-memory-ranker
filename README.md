@@ -24,6 +24,59 @@ Full LongMemEval-S (500 questions, all 6 categories), `gpt-4o-mini` actor, `gpt-
 
 Reproduce with the `LLM-as-judge` section below.
 
+### Direct comparison with Supermemory / Mastra OM
+
+The published "Full context" baselines in the Supermemory and Mastra OM leaderboards use the **official LongMemEval Chain-of-Note (CoN) prompt** (Wu et al. 2024, Fig 13) — *not* the prompt our v3 baseline uses. To reproduce a row that lands on the same leaderboard, set `--baseline_prompt_style=lme_official`. This swaps out our system prompt for the verbatim CoN prompt:
+
+```text
+I will give you several history chats between you and a user. Please answer the
+question based on the relevant chat history. Answer the question step by step:
+first extract all the relevant information, and then reason over the
+information to get the answer.
+
+History Chats: {chat_history}
+
+Current Date: {question_date}
+```
+
+(The question itself is sent as the user message; the model is then expected to write step-by-step reasoning + an answer in free form.)
+
+To produce a Supermemory-comparable headline number with `gpt-4o` as the actor (~\$22 actor + \$0.46 judge):
+
+```sh
+export OPENAI_API_KEY=...
+./venv/bin/python run_longmemeval_protocol.py \
+  --openai_model=gpt-4o \
+  --reports_dir=reports/longmemeval_full_supermemory_compare \
+  --run_conditions=s_full_history,s_memory \
+  --run_retrieval_logs=False \
+  --baseline_prompt_style=lme_official \
+  --memory_recency_bias=0.3 \
+  --memory_use_bm25=True \
+  --memory_use_query_expansion=True \
+  --memory_diversity=0.2 \
+  --judge_model=gpt-4o \
+  --table_metric=judge_accuracy
+```
+
+For a cheap iteration of the same setup (~\$1.30 + \$0.46), keep `--openai_model=gpt-4o-mini` instead.
+
+Published reference points on this exact leaderboard (gpt-4o judge, official CoN baseline):
+
+| System | Actor | Overall |
+|---|---|---:|
+| Mastra OM | gpt-5-mini | 94.87% |
+| Mastra OM | gemini-3-pro | 93.27% |
+| Supermemory | gemini-3-pro | 85.20% |
+| Supermemory | gpt-5 | 84.60% |
+| Mastra OM | gpt-4o | 84.23% |
+| Supermemory | gpt-4o | 81.60% |
+| Mastra RAG (topK 20) | gpt-4o | 80.05% |
+| Zep | gpt-4o | 71.20% |
+| Full context (CoN baseline) | gpt-4o | 60.20% |
+
+(Source: [mastra.ai/research/observational-memory](https://mastra.ai/research/observational-memory))
+
 ## Layout
 
 - `memory/`: memory store, embeddings, retrieval, critic, policies, explainability

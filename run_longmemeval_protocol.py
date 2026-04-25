@@ -64,6 +64,11 @@ memory_diversity = 0.0
 memory_rerank_top_k = 0
 memory_recency_bias = 0.0
 memory_recency_bias_kinds = "knowledge-update"
+# Baseline prompt style: "v3" = our prompt routing (preference/yes-no/abstain),
+# "lme_official" = verbatim Chain-of-Note prompt from the LongMemEval paper
+# (also used by Supermemory / Mastra OM for their published "Full context"
+# baseline rows). Use lme_official for direct cross-system comparison.
+baseline_prompt_style = "v3"
 apply_argv_overrides(globals())
 question_types = normalize_question_types(question_types)
 
@@ -125,6 +130,7 @@ def _run_condition(label, dataset_path, memory_enabled, reader_context_mode):
         f"--include_assistant_turns={include_assistant_turns}",
         f"--history_format={history_format}",
         f"--history_granularity={history_granularity}",
+        f"--baseline_prompt_style={baseline_prompt_style}",
     ]
     if max_examples > 0:
         args.append(f"--max_examples={max_examples}")

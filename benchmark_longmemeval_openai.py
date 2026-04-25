@@ -95,6 +95,13 @@ memory_recency_bias = 0.0
 memory_recency_bias_kinds = "knowledge-update"
 reader_context_mode = "auto"
 history_format = "nl"
+# Prompt style for the full-history baseline. "v3" uses our own
+# instructions (with abstain + Final-answer formatting). "lme_official"
+# mirrors the official LongMemEval Chain-of-Note baseline prompt from
+# Wu et al. 2024 (Fig 13), which is also what Supermemory and Mastra
+# report against. Use lme_official for direct comparability with their
+# published "Full context" leaderboard rows.
+baseline_prompt_style = "v3"
 openai_api_key = ""
 openai_base_url = "https://api.openai.com/v1"
 openai_model = "gpt-4.1-mini"
@@ -108,7 +115,32 @@ question_types = normalize_question_types(question_types)
 # -----------------------------------------------------------------------------
 
 
+def _build_lme_official_instructions(plan, history_context=""):
+    """Verbatim Chain-of-Note baseline prompt from the LongMemEval paper.
+
+    Reference: Wu et al. 2024, Fig 13 (CoN reading strategy). Identical to
+    the prompt Supermemory / Mastra OM use for their "Full context" baseline
+    on the public LongMemEval-S leaderboard, so this is the right choice
+    for direct cross-system comparison.
+    """
+    preamble = (
+        "I will give you several history chats between you and a user. "
+        "Please answer the question based on the relevant chat history. "
+        "Answer the question step by step: first extract all the relevant "
+        "information, and then reason over the information to get the answer."
+    )
+    sections = [preamble]
+    if history_context:
+        sections.append(f"History Chats:\n{history_context.strip()}")
+    question_date = (getattr(plan, "question_date", "") or "").strip()
+    if question_date:
+        sections.append(f"Current Date: {question_date}")
+    return "\n\n".join(sections)
+
+
 def _build_baseline_instructions(plan, history_context="", base_system_prompt=None):
+    if baseline_prompt_style == "lme_official":
+        return _build_lme_official_instructions(plan, history_context=history_context)
     parts = [base_system_prompt or DEFAULT_SYSTEM_PROMPT]
     if history_context:
         parts.append("Use only the provided chat history as evidence. If the answer is not supported by the history, respond with 'Insufficient evidence'.")
@@ -718,7 +750,14 @@ def _process_one(index, instance):
                     instructions=instructions,
                     user_input=query_text,
                     max_output_tokens=(
-                        max(max_new_tokens, 384)
+                        # Official LongMemEval CoN baseline expects step-by-step
+                        # reasoning + answer in a single message; give it room.
+                        max(max_new_tokens, 512)
+                        if (
+                            baseline_prompt_style == "lme_official"
+                            and resolved_context_mode in {"full-history", "oracle-history"}
+                        )
+                        else max(max_new_tokens, 384)
                         if (plan.reasoning_kind or "").lower() == "preference"
                         else max(max_new_tokens, 256)
                         if (
