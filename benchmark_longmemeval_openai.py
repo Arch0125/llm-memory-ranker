@@ -48,7 +48,7 @@ from memory import (
     MemoryAwareInference,
     SQLiteMemoryStore,
     build_embedder,
-    final_answer_instruction,
+    answer_instruction_for_plan,
 )
 from memory.explain import build_trace, format_trace
 from prompt.template import DEFAULT_SYSTEM_PROMPT
@@ -113,7 +113,15 @@ def _build_baseline_instructions(plan, history_context="", base_system_prompt=No
     if history_context:
         parts.append("Use only the provided chat history as evidence. If the answer is not supported by the history, respond with 'Insufficient evidence'.")
         parts.append(f"Chat history:\n{history_context.strip()}")
-    if plan.is_multi_session:
+    if (plan.reasoning_kind or "").lower() == "preference":
+        parts.append(
+            "Synthesize the user's preferences from the chat history and "
+            "produce a 1-3 sentence preference profile that answers the "
+            "question. Do NOT abstain when the history shows relevant "
+            "context — infer the user's likely preference from their "
+            "stated tastes, goals, and dislikes."
+        )
+    elif plan.is_multi_session:
         if plan.multi_session_kind in {"count_entries", "count_distinct"}:
             parts.append("Return only the final number.")
         elif plan.multi_session_kind == "sum_money":
@@ -133,8 +141,16 @@ def _build_baseline_instructions(plan, history_context="", base_system_prompt=No
     elif plan.reasoning_kind == "date":
         parts.append("Return only the final date or short date phrase.")
     else:
-        parts.append("Return only the final answer.")
-    parts.append(final_answer_instruction())
+        from memory.prompting import is_yes_no_question
+
+        if is_yes_no_question(plan.question):
+            parts.append(
+                "This is a yes/no question. Reply with the single token "
+                "'Yes' or 'No' on the Final-answer line."
+            )
+        else:
+            parts.append("Return only the final answer.")
+    parts.append(answer_instruction_for_plan(plan))
     return "\n\n".join(parts)
 
 
@@ -174,7 +190,21 @@ def _build_memory_session_instructions(
         )
     if session_context:
         parts.append(f"Selected supporting evidence:\n{session_context.strip()}")
-    if plan.is_multi_session:
+    if (plan.reasoning_kind or "").lower() == "preference":
+        # SSP-style preference profile: model must produce 1-3 sentences
+        # describing what the user would and would not prefer. The generic
+        # preference_answer_instruction (appended below) carries the formal
+        # spec; here we add LongMemEval-specific anti-abstention guidance
+        # because retrieval gives us perfect session recall on these.
+        parts.append(
+            "The selected excerpts come from the user's own chat history and "
+            "contain relevant preferences, goals, or dislikes. Synthesize a "
+            "tailored recommendation. Do NOT reply 'Insufficient evidence' "
+            "for these preference questions — even if the excerpt does not "
+            "literally state an answer, infer what the user would likely "
+            "prefer from their stated tastes and behaviour."
+        )
+    elif plan.is_multi_session:
         parts.append("For multi-session questions, combine information across ALL the selected session excerpts.")
         if plan.multi_session_kind in {"count_entries", "count_distinct"}:
             subject = plan.multi_session_subject or "items"
@@ -220,8 +250,26 @@ def _build_memory_session_instructions(
     elif plan.reasoning_kind == "date":
         parts.append("Return only the final date or short date phrase. Look at the session date headers (e.g., 'Session on 2023-05-15') for date information.")
     else:
-        parts.append("Return only the final answer, even if the evidence is partial. Prefer giving a best-effort answer over abstaining.")
-    if strict_abstention:
+        from memory.prompting import is_yes_no_question
+
+        if is_yes_no_question(plan.question):
+            parts.append(
+                "This is a yes/no question. Reply with the single token 'Yes' "
+                "or 'No' on the Final-answer line — do NOT replace it with a "
+                "frequency, quantity, or descriptive sentence even if you "
+                "include such detail in your reasoning."
+            )
+        else:
+            parts.append(
+                "Return only the final answer, even if the evidence is partial. Prefer giving a best-effort answer over abstaining."
+            )
+    is_preference = (plan.reasoning_kind or "").lower() == "preference"
+    if is_preference:
+        # Skip the abstention dance for preference profiles — the preference
+        # instruction already tells the model what to do and we never want
+        # 'Insufficient evidence' here.
+        pass
+    elif strict_abstention:
         parts.append("If the question asks about something not clearly supported by the excerpts, respond with 'Insufficient evidence'. Be careful not to guess.")
     elif evidence_sufficient:
         parts.append(
@@ -233,7 +281,7 @@ def _build_memory_session_instructions(
             "Try to extract an answer from the excerpts. Give your best answer even if the evidence is partial. "
             "Only reply 'Insufficient evidence' if the excerpts contain absolutely no relevant information at all."
         )
-    parts.append(final_answer_instruction())
+    parts.append(answer_instruction_for_plan(plan))
     return "\n\n".join(parts)
 
 
@@ -670,7 +718,9 @@ def _process_one(index, instance):
                     instructions=instructions,
                     user_input=query_text,
                     max_output_tokens=(
-                        max(max_new_tokens, 256)
+                        max(max_new_tokens, 384)
+                        if (plan.reasoning_kind or "").lower() == "preference"
+                        else max(max_new_tokens, 256)
                         if (
                             plan.is_multi_session
                             or (plan.is_temporal and ("order" in plan.question.lower() or plan.reasoning_kind == "ordering"))

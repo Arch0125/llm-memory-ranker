@@ -301,6 +301,175 @@ class RecencyBiasTests(unittest.TestCase):
         self.assertEqual(b.score, 0.78)
 
 
+class YesNoDetectionTests(unittest.TestCase):
+    def test_first_person_yes_no_detected(self):
+        from memory.prompting import is_yes_no_question
+
+        for q in [
+            "Do I have a spare screwdriver?",
+            "Did I pay the electric bill last month?",
+            "Have I tried Emma's recipes?",
+            "Is my partner vegan?",
+            "Was it raining when we met?",
+            "Should I cancel my subscription?",
+        ]:
+            self.assertTrue(is_yes_no_question(q), q)
+
+    def test_open_request_not_treated_as_yes_no(self):
+        from memory.prompting import is_yes_no_question
+
+        for q in [
+            "Can you suggest a good restaurant?",
+            "Could you recommend a podcast?",
+            "Would you list some hotels in Miami?",
+            "Will you describe my project?",
+        ]:
+            self.assertFalse(is_yes_no_question(q), q)
+
+    def test_open_questions_not_treated_as_yes_no(self):
+        from memory.prompting import is_yes_no_question
+
+        self.assertFalse(is_yes_no_question(""))
+        self.assertFalse(is_yes_no_question("What is my partner's name?"))
+        self.assertFalse(is_yes_no_question("Where did Rachel move to?"))
+
+
+class PromptingTests(unittest.TestCase):
+    def test_answer_instruction_for_plan_routes_preference(self):
+        from memory.prompting import (
+            answer_instruction_for_plan,
+            final_answer_instruction,
+            preference_answer_instruction,
+        )
+
+        pref_plan = QueryPlan(
+            question="What kind of restaurant should I try this weekend?",
+            query_text="restaurant recommendation",
+            reasoning_kind="preference",
+            question_type="single-session-preference",
+        )
+        factual_plan = QueryPlan(
+            question="When did I move to Berlin?",
+            query_text="move to Berlin",
+            reasoning_kind="factual",
+            question_type="single-session-user",
+        )
+
+        self.assertEqual(
+            answer_instruction_for_plan(pref_plan), preference_answer_instruction()
+        )
+        self.assertEqual(
+            answer_instruction_for_plan(factual_plan), final_answer_instruction()
+        )
+        self.assertEqual(answer_instruction_for_plan(None), final_answer_instruction())
+        # The preference fragment talks about preferences and explicitly tells
+        # the model NOT to emit the terse 'Final answer:' line.
+        pref = preference_answer_instruction()
+        self.assertIn("would prefer", pref)
+        self.assertIn("Do NOT end", pref)
+
+    def test_answer_instruction_for_plan_routes_yes_no(self):
+        from memory.prompting import (
+            answer_instruction_for_plan,
+            yes_no_answer_instruction,
+        )
+
+        yn_plan = QueryPlan(
+            question="Do I have a spare screwdriver?",
+            query_text="spare screwdriver",
+            reasoning_kind="factual",
+            question_type="knowledge-update",
+        )
+        # Multi-session yes/no opener should still get the normal final-answer
+        # instruction, since multi-session implies an aggregated value.
+        ms_plan = QueryPlan(
+            question="Did I spend more than $100 on coffee this year?",
+            query_text="coffee spending",
+            reasoning_kind="multi-session",
+            question_type="multi-session",
+        )
+
+        self.assertEqual(
+            answer_instruction_for_plan(yn_plan), yes_no_answer_instruction()
+        )
+        self.assertNotEqual(
+            answer_instruction_for_plan(ms_plan), yes_no_answer_instruction()
+        )
+
+
+class PreferencePostprocessTests(unittest.TestCase):
+    def test_postprocess_keeps_multi_sentence_for_preference(self):
+        from benchmarks.longmemeval import QuestionPlan, postprocess_prediction
+
+        plan = QuestionPlan(
+            question_id="q1",
+            question_type="single-session-preference",
+            question="What kind of restaurant should I try?",
+            query_text="restaurant",
+            question_date="",
+            normalized_question_date="",
+            reasoning_kind="preference",
+            is_temporal=False,
+            unit_hint="",
+            targets=[],
+            normalized_targets=[],
+            query_entities=[],
+            question_month="",
+            ordering_direction="first",
+            filter_month="",
+            is_multi_session=False,
+            multi_session_kind="",
+            multi_session_subject="",
+            multi_session_actions=[],
+            multi_session_focus_terms=[],
+            range_start="",
+            range_end="",
+            requires_distinct=False,
+            requires_current_state=False,
+        )
+        raw = (
+            "The user would prefer a quiet ramen shop with vegetarian options "
+            "and counter seating, since they have mentioned enjoying calm "
+            "evenings and avoiding loud groups. They would not prefer a "
+            "loud sports bar.\nFinal answer: ramen"
+        )
+        cleaned = postprocess_prediction(plan, raw)
+        self.assertIn("would prefer", cleaned)
+        self.assertIn("would not prefer", cleaned)
+        self.assertNotIn("Final answer", cleaned)
+
+
+class LongMemEvalAnalyzerTests(unittest.TestCase):
+    def test_ssp_question_gets_preference_reasoning_kind(self):
+        from benchmarks.longmemeval import analyze_question
+
+        plan = analyze_question(
+            {
+                "question_id": "ssp1",
+                "question": "What kind of book should I read this weekend?",
+                "question_date": "2024-05-01",
+                "question_type": "single-session-preference",
+                "haystack_sessions": [],
+            }
+        )
+        self.assertEqual(plan.reasoning_kind, "preference")
+        self.assertFalse(plan.is_multi_session)
+
+    def test_ssu_question_keeps_factual_reasoning_kind(self):
+        from benchmarks.longmemeval import analyze_question
+
+        plan = analyze_question(
+            {
+                "question_id": "ssu1",
+                "question": "What is my partner's name?",
+                "question_date": "2024-05-01",
+                "question_type": "single-session-user",
+                "haystack_sessions": [],
+            }
+        )
+        self.assertEqual(plan.reasoning_kind, "factual")
+
+
 class BM25Tests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

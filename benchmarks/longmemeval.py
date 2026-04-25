@@ -3158,6 +3158,12 @@ def analyze_question(instance, include_question_date=True):
         reasoning_kind = "multi-session"
         unit_hint = _infer_quantity_unit(question)
         multi_session = _analyze_multi_session(question, normalized_question_date)
+    elif question_type == "single-session-preference":
+        # SSP gold answers are multi-sentence preference profiles
+        # ("the user would prefer X / would not prefer Y") that no terse
+        # `Final answer:` line can satisfy. Route them through the generic
+        # preference plan kind so prompt builders pick the matching style.
+        reasoning_kind = "preference"
     else:
         if "how many days" in lowered:
             reasoning_kind = "difference"
@@ -4535,6 +4541,15 @@ def postprocess_prediction(plan, text):
     value = _collapse(text)
     if not value:
         return value
+    if (getattr(plan, "reasoning_kind", "") or "").lower() == "preference":
+        # Preference questions expect a multi-sentence profile; do not strip
+        # to a terse marker. We still trim leading/trailing whitespace and
+        # drop any trailing 'Final answer:' line a chatty model may emit.
+        cleaned = raw_text.strip()
+        cleaned = re.sub(
+            r"(?im)\n\s*final\s*answer\s*[:\-].*$", "", cleaned
+        ).strip()
+        return cleaned or value
     final_answer = extract_final_answer_marker(raw_text)
     if final_answer:
         raw_text = final_answer
