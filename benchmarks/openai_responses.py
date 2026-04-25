@@ -100,11 +100,17 @@ def create_response(
                 }
             except httpx.HTTPError as exc:
                 last_error = exc
-                if getattr(exc, "response", None) is not None:
+                resp = getattr(exc, "response", None)
+                if resp is not None:
                     try:
-                        last_error_body = json.dumps(exc.response.json(), ensure_ascii=True)
+                        last_error_body = json.dumps(resp.json(), ensure_ascii=True)
                     except Exception:
-                        last_error_body = exc.response.text
+                        last_error_body = resp.text
+                # Fail fast on non-retryable client errors (400/401/403/404/422)
+                # — retrying just hides the real bug and burns wall-clock time.
+                status = getattr(resp, "status_code", None)
+                if status is not None and status not in {408, 409, 425, 429, 500, 502, 503, 504}:
+                    break
                 if attempt >= max_retries:
                     break
                 time.sleep(min(8.0, 0.75 * (2 ** attempt)))

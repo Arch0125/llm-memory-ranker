@@ -7,6 +7,23 @@ This repository is an experimentation workspace for:
 
 The core memory system leaves the generator unchanged. It stores hybrid benchmark memories (facts, episode summaries, and timeline memories), extracts temporal metadata, bundles relevant evidence, and then sends a structured evidence table to OpenAI for generation.
 
+## Headline Results — LongMemEval-S, LLM-as-judge
+
+Full LongMemEval-S (500 questions, all 6 categories), `gpt-4o-mini` actor, `gpt-4o` judge with the official LongMemEval prompt templates. Methodology mirrors Supermemory / Mastra OM (binary correct/incorrect; overall = unweighted mean over the 6 categories).
+
+| Configuration | SSU | SSA | SSP | KU | TR | MS | **Overall** |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Full-history, naïve prompt (raw chat dumped to model) | 87.14% | 17.86% | 0.00% | 74.36% | 32.33% | 38.35% | **41.67%** |
+| Full-history, v3 prompts (preference + yes/no routing, no memory) | 85.71% | 17.86% | 26.67% | 73.08% | 33.83% | 37.59% | **45.79%** |
+| **Memory layer v3** (`rrf` + `bm25` + query expansion + diversity 0.2 + recency 0.3 + preference + yes/no) | **91.43%** | **71.43%** | **33.33%** | **76.92%** | **61.65%** | **61.65%** | **66.07%** |
+
+**Decomposition of the +24.40 overall lift:**
+
+- **Prompt routing alone** (preference + yes/no, full history): **+4.12** vs naïve baseline. Almost entirely from SSP recovering from `0.00% → 26.67%` (the naïve baseline auto-abstains on preference questions).
+- **Memory layer alone** (added on top of v3 prompts): **+20.28**. The honest contribution of the retrieval/ranking stack — biggest wins on SSA (+53.57), TR (+27.82), MS (+24.06).
+
+Reproduce with the `LLM-as-judge` section below.
+
 ## Layout
 
 - `memory/`: memory store, embeddings, retrieval, critic, policies, explainability

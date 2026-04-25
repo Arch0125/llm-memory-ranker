@@ -223,7 +223,9 @@ def _grade_one(
         model=judge_model,
         instructions="You are a strict evaluator. Answer 'yes' or 'no' only.",
         user_input=prompt,
-        max_output_tokens=10,
+        # OpenAI Responses API requires max_output_tokens >= 16; the judge
+        # only ever needs to emit "yes"/"no" so 16 is plenty of slack.
+        max_output_tokens=16,
         temperature=0.0,
         top_p=1.0,
     )
