@@ -46,6 +46,20 @@ def normalize_question_types(value: str) -> str:
     return ",".join(canonical)
 
 
+def question_type_matches(question_type: str, normalized_filter: str) -> bool:
+    """Return True if ``question_type`` is selected by ``normalized_filter``.
+
+    ``normalized_filter`` is the comma-separated string returned by
+    :func:`normalize_question_types`. An empty filter matches everything.
+    """
+    if not normalized_filter:
+        return True
+    allowed = {item.strip() for item in normalized_filter.split(",") if item.strip()}
+    if not allowed:
+        return True
+    return (question_type or "").strip() in allowed
+
+
 def question_type_slug(value: str) -> str:
     normalized = normalize_question_types(value)
     if not normalized:

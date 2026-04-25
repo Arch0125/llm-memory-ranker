@@ -13,3 +13,4 @@ venv/
 memory.sqlite
 data/
 reports/
+.cache/

@@ -35,6 +35,12 @@ official_repo_path = ""
 official_eval_model = "gpt-4o"
 run_conditions = "s_full_history,s_memory,oracle_upper_bound"
 question_types = ""
+# Forwarded to benchmark_longmemeval_openai.py for the s_memory condition.
+memory_fusion_strategy = "weighted"
+memory_use_bm25 = False
+memory_use_query_expansion = False
+memory_diversity = 0.0
+memory_rerank_top_k = 0
 apply_argv_overrides(globals())
 question_types = normalize_question_types(question_types)
 
@@ -101,6 +107,14 @@ def _run_condition(label, dataset_path, memory_enabled, reader_context_mode):
         args.append(f"--max_examples={max_examples}")
     if question_types:
         args.append(f"--question_types={question_types}")
+    if memory_enabled:
+        args.extend([
+            f"--memory_fusion_strategy={memory_fusion_strategy}",
+            f"--memory_use_bm25={memory_use_bm25}",
+            f"--memory_use_query_expansion={memory_use_query_expansion}",
+            f"--memory_diversity={memory_diversity}",
+            f"--memory_rerank_top_k={memory_rerank_top_k}",
+        ])
 
     cmd = _run_python(args, cwd=str(ROOT))
     return {

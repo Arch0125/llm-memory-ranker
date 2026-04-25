@@ -77,6 +77,14 @@ memory_explain = False
 memory_solver_mode = "hybrid"
 memory_solver_min_confidence = 0.72
 memory_structured_event_limit = 4
+# Generic retrieval upgrades (opt-in; default off keeps existing behaviour).
+memory_fusion_strategy = "weighted"     # "rrf" or "weighted"
+memory_use_bm25 = False
+memory_use_query_expansion = False
+memory_keyword_weight = 0.35
+memory_diversity = 0.0
+memory_rerank_top_k = 0
+memory_rerank_blend = 0.7
 reader_context_mode = "auto"
 history_format = "nl"
 openai_api_key = ""
@@ -239,9 +247,15 @@ def _effective_policy(plan):
 
 
 def _make_memory_system(store, embedder, policy):
+    reranker = None
+    if memory_rerank_top_k and memory_rerank_top_k > 0:
+        from memory.rerank import CrossEncoderReranker
+
+        reranker = CrossEncoderReranker.try_load()
     return MemoryAwareInference(
         store=store,
         embedder=embedder,
+        reranker=reranker,
         config=MemoryAwareConfig(
             user_id=memory_user_id,
             top_k=policy["top_k"],
@@ -252,6 +266,13 @@ def _make_memory_system(store, embedder, policy):
             max_age_days=None if memory_max_age_days < 0 else memory_max_age_days,
             memory_token_budget=policy["token_budget"],
             type_allowlist=memory_type_allowlist,
+            fusion_strategy=memory_fusion_strategy,
+            use_bm25=memory_use_bm25,
+            use_query_expansion=memory_use_query_expansion,
+            keyword_weight=memory_keyword_weight,
+            diversity=memory_diversity,
+            rerank_top_k=memory_rerank_top_k,
+            rerank_blend=memory_rerank_blend,
         ),
     )
 
