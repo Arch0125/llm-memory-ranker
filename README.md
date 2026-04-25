@@ -7,26 +7,67 @@ This repository is an experimentation workspace for:
 
 The core memory system leaves the generator unchanged. It stores hybrid benchmark memories (facts, episode summaries, and timeline memories), extracts temporal metadata, bundles relevant evidence, and then sends a structured evidence table to OpenAI for generation.
 
-## Headline Results — LongMemEval-S, LLM-as-judge
+## Headline Results — LongMemEval-S, gpt-4o, LLM-as-judge
 
-Full LongMemEval-S (500 questions, all 6 categories), `gpt-4o-mini` actor, `gpt-4o` judge with the official LongMemEval prompt templates. Methodology mirrors Supermemory / Mastra OM (binary correct/incorrect; overall = unweighted mean over the 6 categories).
+Full LongMemEval-S (500 questions, all 6 categories), `gpt-4o` actor and `gpt-4o` judge with the official LongMemEval per-question-type judge templates. Methodology mirrors Supermemory / Mastra OM exactly (binary correct/incorrect, overall = unweighted mean over the 6 categories, official CoN baseline prompt for the full-context row).
+
+| System | Actor | SSU | SSA | SSP | KU | TR | MS | **Overall** |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| Mastra OM | gpt-4o | — | — | — | — | — | — | **84.23%** |
+| Supermemory | gpt-4o | — | — | — | — | — | — | **81.60%** |
+| Mastra RAG (topK 20) | gpt-4o | — | — | — | — | — | — | **80.05%** |
+| **Memory layer (this repo)** | **gpt-4o** | **92.86%** | **78.57%** | **46.67%** | **89.74%** | **72.18%** | **69.92%** | **74.99%** |
+| Zep | gpt-4o | — | — | — | — | — | — | 71.20% |
+| Full context (CoN baseline) | gpt-4o | — | — | — | — | — | — | 60.20% |
+
+We land **+14.79 above the official CoN baseline** and **+3.79 above Zep**, with **−6.61 to Supermemory** and **−9.24 to Mastra OM** as visible headroom. Reference numbers for other systems come from [mastra.ai/research/observational-memory](https://mastra.ai/research/observational-memory).
+
+Cost per run: ~\$3.46 actor + ~\$0.23 judge ≈ **\$3.69** for a publishable leaderboard row, ~30 minutes wall time on 8 parallel workers.
+
+### Transparent decomposition (gpt-4o-mini, cheap to reproduce)
+
+The same memory stack with `gpt-4o-mini` as the actor (~\$1.30 actor + \$0.46 judge):
 
 | Configuration | SSU | SSA | SSP | KU | TR | MS | **Overall** |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | Full-history, naïve prompt (raw chat dumped to model) | 87.14% | 17.86% | 0.00% | 74.36% | 32.33% | 38.35% | **41.67%** |
 | Full-history, v3 prompts (preference + yes/no routing, no memory) | 85.71% | 17.86% | 26.67% | 73.08% | 33.83% | 37.59% | **45.79%** |
-| **Memory layer v3** (`rrf` + `bm25` + query expansion + diversity 0.2 + recency 0.3 + preference + yes/no) | **91.43%** | **71.43%** | **33.33%** | **76.92%** | **61.65%** | **61.65%** | **66.07%** |
+| Full-history, official CoN prompt (no memory) | 95.71% | 25.00% | 26.67% | 79.49% | 39.85% | 49.62% | **52.72%** |
+| **Memory layer (gpt-4o-mini)** | **92.86%** | **73.21%** | **40.00%** | **78.21%** | **63.16%** | **60.15%** | **67.93%** |
 
-**Decomposition of the +24.40 overall lift:**
+Two findings worth noting:
 
-- **Prompt routing alone** (preference + yes/no, full history): **+4.12** vs naïve baseline. Almost entirely from SSP recovering from `0.00% → 26.67%` (the naïve baseline auto-abstains on preference questions).
-- **Memory layer alone** (added on top of v3 prompts): **+20.28**. The honest contribution of the retrieval/ranking stack — biggest wins on SSA (+53.57), TR (+27.82), MS (+24.06).
+- **Prompt engineering alone** moves the gpt-4o-mini baseline from 41.67% → 52.72% — the official CoN prompt is materially better than terse "Final answer:" prompting, especially on SSU.
+- **Memory layer alone** (CoN baseline → memory) adds **+15.21** on gpt-4o-mini and **+14.79** on gpt-4o, so the lift is consistent across model scale.
 
-Reproduce with the `LLM-as-judge` section below.
+### Reproducing the headline row
 
-### Direct comparison with Supermemory / Mastra OM
+```sh
+export OPENAI_API_KEY=...
+./venv/bin/python run_longmemeval_protocol.py \
+  --openai_model=gpt-4o \
+  --reports_dir=reports/longmemeval_full_supermemory_compare_4o \
+  --run_conditions=s_memory \
+  --run_retrieval_logs=False \
+  --baseline_prompt_style=lme_official \
+  --memory_recency_bias=0.3 \
+  --memory_use_bm25=True \
+  --memory_use_query_expansion=True \
+  --memory_diversity=0.2 \
+  --judge_model=gpt-4o \
+  --table_metric=judge_accuracy
+```
 
-The published "Full context" baselines in the Supermemory and Mastra OM leaderboards use the **official LongMemEval Chain-of-Note (CoN) prompt** (Wu et al. 2024, Fig 13) — *not* the prompt our v3 baseline uses. To reproduce a row that lands on the same leaderboard, set `--baseline_prompt_style=lme_official`. This swaps out our system prompt for the verbatim CoN prompt:
+Add `--run_conditions=s_full_history,s_memory` to also run the official-CoN-prompt baseline locally (extra ~\$18.40, ~25 min); otherwise the published 60.20% stands in.
+
+### How the comparison is set up
+
+Both the published "Full context" baseline and our memory layer share:
+
+- **Actor model**: `gpt-4o` (Supermemory / Mastra OM use the same)
+- **Judge**: `gpt-4o` with the verbatim per-question-type templates from the official LongMemEval `evaluate_qa.py` (re-implemented in `benchmarks/longmemeval_judge.py`)
+- **Score**: binary correct/incorrect, overall = unweighted mean over the 6 categories
+- **Baseline prompt**: the official Chain-of-Note prompt from Wu et al. 2024, Fig 13 — selectable via `--baseline_prompt_style=lme_official`:
 
 ```text
 I will give you several history chats between you and a user. Please answer the
@@ -41,27 +82,7 @@ Current Date: {question_date}
 
 (The question itself is sent as the user message; the model is then expected to write step-by-step reasoning + an answer in free form.)
 
-To produce a Supermemory-comparable headline number with `gpt-4o` as the actor (~\$22 actor + \$0.46 judge):
-
-```sh
-export OPENAI_API_KEY=...
-./venv/bin/python run_longmemeval_protocol.py \
-  --openai_model=gpt-4o \
-  --reports_dir=reports/longmemeval_full_supermemory_compare \
-  --run_conditions=s_full_history,s_memory \
-  --run_retrieval_logs=False \
-  --baseline_prompt_style=lme_official \
-  --memory_recency_bias=0.3 \
-  --memory_use_bm25=True \
-  --memory_use_query_expansion=True \
-  --memory_diversity=0.2 \
-  --judge_model=gpt-4o \
-  --table_metric=judge_accuracy
-```
-
-For a cheap iteration of the same setup (~\$1.30 + \$0.46), keep `--openai_model=gpt-4o-mini` instead.
-
-Published reference points on this exact leaderboard (gpt-4o judge, official CoN baseline):
+Wider published context with newer / non-`gpt-4o` actors on the same leaderboard:
 
 | System | Actor | Overall |
 |---|---|---:|
@@ -69,11 +90,6 @@ Published reference points on this exact leaderboard (gpt-4o judge, official CoN
 | Mastra OM | gemini-3-pro | 93.27% |
 | Supermemory | gemini-3-pro | 85.20% |
 | Supermemory | gpt-5 | 84.60% |
-| Mastra OM | gpt-4o | 84.23% |
-| Supermemory | gpt-4o | 81.60% |
-| Mastra RAG (topK 20) | gpt-4o | 80.05% |
-| Zep | gpt-4o | 71.20% |
-| Full context (CoN baseline) | gpt-4o | 60.20% |
 
 (Source: [mastra.ai/research/observational-memory](https://mastra.ai/research/observational-memory))
 
