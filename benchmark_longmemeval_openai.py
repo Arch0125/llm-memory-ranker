@@ -43,7 +43,13 @@ from benchmarks.longmemeval import (
     token_f1_score,
 )
 from benchmarks.openai_responses import build_responses_payload, create_response
-from memory import MemoryAwareConfig, MemoryAwareInference, SQLiteMemoryStore, build_embedder
+from memory import (
+    MemoryAwareConfig,
+    MemoryAwareInference,
+    SQLiteMemoryStore,
+    build_embedder,
+    final_answer_instruction,
+)
 from memory.explain import build_trace, format_trace
 from prompt.template import DEFAULT_SYSTEM_PROMPT
 
@@ -126,6 +132,7 @@ def _build_baseline_instructions(plan, history_context="", base_system_prompt=No
         parts.append("Return only the final date or short date phrase.")
     else:
         parts.append("Return only the final answer.")
+    parts.append(final_answer_instruction())
     return "\n\n".join(parts)
 
 
@@ -224,6 +231,7 @@ def _build_memory_session_instructions(
             "Try to extract an answer from the excerpts. Give your best answer even if the evidence is partial. "
             "Only reply 'Insufficient evidence' if the excerpts contain absolutely no relevant information at all."
         )
+    parts.append(final_answer_instruction())
     return "\n\n".join(parts)
 
 
