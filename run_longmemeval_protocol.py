@@ -35,6 +35,9 @@ official_repo_path = ""
 official_eval_model = "gpt-4o"
 run_conditions = "s_full_history,s_memory,oracle_upper_bound"
 question_types = ""
+# Set to False to skip the post-hoc retrieval-log passes (session + turn) — they
+# add ~30-60s and are diagnostic-only.
+run_retrieval_logs = True
 # Forwarded to benchmark_longmemeval_openai.py for the s_memory condition.
 memory_fusion_strategy = "weighted"
 memory_use_bm25 = False
@@ -297,7 +300,7 @@ for name in conditions:
         condition.update(_run_official_eval(condition))
     manifest["conditions"].append(condition)
 
-if "s_memory" in conditions:
+if "s_memory" in conditions and run_retrieval_logs:
     for granularity in ("session", "turn"):
         retrieval_condition = _run_retrieval_condition(
             label="s_memory",
