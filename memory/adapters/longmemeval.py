@@ -19,6 +19,15 @@ def _question_plan_to_query_plan(qp) -> QueryPlan:
     """Convert the harness's `QuestionPlan` dataclass to a generic `QueryPlan`."""
     payload = asdict(qp) if is_dataclass(qp) else dict(qp)
 
+    target_dates: list[str] = []
+    target_window: tuple[str, str] = ("", "")
+    try:
+        from benchmarks.longmemeval import derive_retrieval_target_dates
+
+        target_dates, target_window = derive_retrieval_target_dates(qp)
+    except Exception:
+        target_dates, target_window = [], ("", "")
+
     metadata = {
         "question_id": payload.get("question_id", ""),
         "normalized_question_date": payload.get("normalized_question_date", ""),
@@ -31,6 +40,8 @@ def _question_plan_to_query_plan(qp) -> QueryPlan:
         "range_end": payload.get("range_end", ""),
         "requires_distinct": payload.get("requires_distinct", False),
         "requires_current_state": payload.get("requires_current_state", False),
+        "retrieval_target_dates": target_dates,
+        "retrieval_target_window": target_window,
         "raw_question_plan": qp,
     }
 

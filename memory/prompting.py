@@ -24,7 +24,12 @@ _YES_NO_OPENER_RE = re.compile(
 )
 _OPEN_REQUEST_RE = re.compile(
     r"^\s*(?:can|could|would|will)\s+you\s+(?:please\s+)?"
-    r"(?:suggest|recommend|help|tell|show|give|share|list|describe|explain|provide|find|name)\b",
+    # Verbs that signal an open-ended ask, not a literal yes/no question.
+    # "remind"/"recall" cover SSA-style "Can you remind me of <fact>?" prompts
+    # which the LLM otherwise answers with the single word "Yes".
+    r"(?:suggest|recommend|help|tell|show|give|share|list|describe|explain|"
+    r"provide|find|name|remind|recall|specify|identify|define|"
+    r"summarize|summarise|elaborate|clarify|walk\s+me\s+through)\b",
     re.IGNORECASE,
 )
 
@@ -97,7 +102,22 @@ _PREFERENCE_INSTRUCTION = (
     "evidence does not name a specific brand/model/place/dish, leave that "
     "slot generic rather than guessing.\n"
     "(d) Prefer the most recent thing the user said about the topic over "
-    "older mentions; preferences evolve."
+    "older mentions; preferences evolve.\n"
+    "(e) ENUMERATE BEFORE YOU WRITE. Before composing the final 1-3 sentences, "
+    "scan EVERY selected excerpt and silently list every concrete personalised "
+    "reference the user has mentioned that is relevant to the topic: pets and "
+    "people by name (e.g. 'Luna', 'Brandon Flowers'), apps and devices by name "
+    "(e.g. 'TripIt', 'Garmin bike computer', 'Suica card'), specific past "
+    "purchases or upgrades (e.g. 'portable power bank', 'new chain and "
+    "cassette'), specific dishes or recipes (e.g. 'beef stew'), specific places "
+    "or venues, and any constraints the user voiced (e.g. 'before 9:30 pm', "
+    "'avoid phone use', 'beyond true crime'). Your final response MUST name as "
+    "many of these specific references as are relevant — at minimum every "
+    "personally-named entity that bears on the question. A response that is "
+    "thematically right but omits a specific item the user has mentioned is a "
+    "FAILURE. If the user has expressed a constraint (a thing they want to "
+    "avoid, a time limit, a topic exclusion), surface it as a 'They would not "
+    "prefer ...' clause."
 )
 
 

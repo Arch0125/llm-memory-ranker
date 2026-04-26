@@ -64,6 +64,9 @@ memory_diversity = 0.0
 memory_rerank_top_k = 0
 memory_recency_bias = 0.0
 memory_recency_bias_kinds = "knowledge-update"
+memory_time_anchor_bias = 0.0
+memory_time_anchor_window_days = 3
+memory_time_anchor_taper_days = 14
 # Baseline prompt style: "v3" = our prompt routing (preference/yes-no/abstain),
 # "lme_official" = verbatim Chain-of-Note prompt from the LongMemEval paper
 # (also used by Supermemory / Mastra OM for their published "Full context"
@@ -145,6 +148,9 @@ def _run_condition(label, dataset_path, memory_enabled, reader_context_mode):
             f"--memory_rerank_top_k={memory_rerank_top_k}",
             f"--memory_recency_bias={memory_recency_bias}",
             f"--memory_recency_bias_kinds={memory_recency_bias_kinds}",
+            f"--memory_time_anchor_bias={memory_time_anchor_bias}",
+            f"--memory_time_anchor_window_days={memory_time_anchor_window_days}",
+            f"--memory_time_anchor_taper_days={memory_time_anchor_taper_days}",
         ])
 
     cmd = _run_python(args, cwd=str(ROOT))
@@ -429,6 +435,8 @@ if print_table:
         config_tag.append(f"rerank={memory_rerank_top_k}")
     if memory_recency_bias:
         config_tag.append(f"recency={memory_recency_bias}")
+    if memory_time_anchor_bias:
+        config_tag.append(f"anchor={memory_time_anchor_bias}")
     memory_label_suffix = f" ({'+'.join(config_tag)})" if config_tag else ""
 
     # Order: full-history first (so it can serve as the Delta baseline), then

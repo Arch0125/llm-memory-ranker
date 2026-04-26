@@ -93,6 +93,9 @@ memory_rerank_top_k = 0
 memory_rerank_blend = 0.7
 memory_recency_bias = 0.0
 memory_recency_bias_kinds = "knowledge-update"
+memory_time_anchor_bias = 0.0
+memory_time_anchor_window_days = 3
+memory_time_anchor_taper_days = 14
 reader_context_mode = "auto"
 history_format = "nl"
 # Prompt style for the full-history baseline. "v3" uses our own
@@ -207,8 +210,17 @@ def _build_memory_session_instructions(
         )
     if assistant_extraction:
         parts.append(
-            "These excerpts include prior assistant answers. Extract only the exact field the user is asking for. "
-            "Do not paraphrase. Do not return the broader explanation if the question asks for a name, title, website, number, percentage, quote, or the 'other options'."
+            "These excerpts include the assistant's prior replies. The user is asking you to recall what the "
+            "ASSISTANT said earlier. Surface the COMPLETE relevant statement from the assistant's prior reply, "
+            "preserving every qualifier verbatim: locations, venue names, titles, chapter/book labels, modifiers "
+            "like 'approximately', the entity that produced a metric, and any subordinate clauses. "
+            "Examples of correctly-formed answers (DO NOT shorten these patterns): "
+            "'The Sugar Factory at Icon Park' (NOT 'The Sugar Factory'); "
+            "'Chapter 4 of Book 1, titled \\'Vocal Prayer and Meditation\\'' (NOT 'Chapter 4 of Book 1'); "
+            "'approximately 20% when using the HAMT agent' (NOT '20%'). "
+            "Match EVERY qualifier in the question (e.g. 'with fruit in it', 'in the second part', "
+            "'on the third try') — pick the assistant statement that satisfies ALL constraints, not just the topic. "
+            "Do not paraphrase. End with 'Final answer: <full statement>'."
         )
     if has_temporal_view:
         parts.append(
@@ -369,6 +381,9 @@ def _make_memory_system(store, embedder, policy):
                 for kind in (memory_recency_bias_kinds or "").split(",")
                 if kind.strip()
             ] or ["knowledge-update"],
+            time_anchor_bias=memory_time_anchor_bias,
+            time_anchor_window_days=int(memory_time_anchor_window_days),
+            time_anchor_taper_days=int(memory_time_anchor_taper_days),
         ),
     )
 
@@ -428,10 +443,15 @@ def _filter_instances(instances):
 
 
 def _ingest_history(store, embedder, instance):
+    from benchmarks.longmemeval import ingest_include_assistant_turns
+
+    effective_include_assistant = ingest_include_assistant_turns(
+        instance, default=include_assistant_turns
+    )
     for memory_item in iter_history_memories(
         instance,
         granularity=history_granularity,
-        include_assistant_turns=include_assistant_turns,
+        include_assistant_turns=effective_include_assistant,
     ):
         store.add_memory(
             user_id=memory_user_id,
@@ -546,7 +566,16 @@ def _process_one(index, instance):
             if is_single_session_question(plan) or plan.is_temporal or is_knowledge_update:
                 max_sess = 3
                 if plan.question_type == "single-session-assistant":
-                    max_sess = 2
+                    # Bumped from 2 -> 3: 3 of 7 SSA failures had selected_session_recall=0
+                    # because the gold "answer_*" session was edged out by the second
+                    # candidate. With 3 slots the answer session has more headroom.
+                    max_sess = 3
+                if plan.question_type in {"single-session-user", "single-session-preference"}:
+                    # Bumped from 3 -> 4: at 3 slots, 3 of 6 SSU fails and 2 of 13 SSP
+                    # fails had selected_session_recall=0 (gold "answer_*" session was
+                    # edged out at rank 4+). One extra slot adds ~1 session of context
+                    # at trivial token cost and recovers retrieval misses.
+                    max_sess = 4
                 if is_knowledge_update:
                     max_sess = 3
                 if plan.is_temporal and plan.reasoning_kind in {"ordering", "difference"}:

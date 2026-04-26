@@ -5,7 +5,7 @@ from memory.cache import CachedEmbedder, InMemoryEmbeddingCache
 from memory.critic import HeuristicCritic, rerank_with_critic
 from memory.expansion import expand_query
 from memory.explain import build_trace
-from memory.recency import apply_recency_bias
+from memory.recency import apply_recency_bias, apply_time_anchor_bias
 from memory.rerank import null_reranker
 from memory.retrieve import (
     gate_hits,
@@ -50,6 +50,15 @@ class MemoryAwareConfig:
     recency_bias_kinds: list[str] = field(
         default_factory=lambda: ["knowledge-update"]
     )
+
+    # Time-anchor bias: when the plan exposes derived retrieval target dates
+    # (e.g. "10 days ago" -> 2023-03-15) or a target window
+    # (`(start_iso, end_iso)`), boost memories whose date matches. 0 disables.
+    # ``time_anchor_window_days`` controls the full-bonus radius around each
+    # target; ``time_anchor_taper_days`` controls the linear taper-to-zero.
+    time_anchor_bias: float = 0.0
+    time_anchor_window_days: int = 3
+    time_anchor_taper_days: int = 14
 
     # Optional benchmark-level state, not used by the core but threaded by
     # adapters wanting to pass per-query plans through to a reranker etc.
@@ -144,6 +153,15 @@ class MemoryAwareInference:
                 strength=self.config.recency_bias,
                 plan=plan,
                 trigger_kinds=self.config.recency_bias_kinds,
+            )
+
+        if self.config.time_anchor_bias > 0 and plan is not None:
+            apply_time_anchor_bias(
+                gated,
+                strength=self.config.time_anchor_bias,
+                plan=plan,
+                window_days=self.config.time_anchor_window_days,
+                taper_days=self.config.time_anchor_taper_days,
             )
 
         if self.config.rerank_top_k and getattr(self.reranker, "available", False):
