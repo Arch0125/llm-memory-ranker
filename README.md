@@ -9,20 +9,28 @@ The core memory system leaves the generator unchanged. It stores hybrid benchmar
 
 ## Headline Results — LongMemEval-S, gpt-4o, LLM-as-judge
 
-Full LongMemEval-S (500 questions, all 6 categories), `gpt-4o` actor and `gpt-4o` judge with the official LongMemEval per-question-type judge templates. Methodology mirrors Supermemory / Mastra OM exactly (binary correct/incorrect, overall = unweighted mean over the 6 categories, official CoN baseline prompt for the full-context row).
+Full LongMemEval-S (500 questions, all 6 categories), `gpt-4o` actor and `gpt-4o` judge with the official LongMemEval per-question-type judge templates (binary correct/incorrect, official Chain-of-Note prompt for the full-context row). Same actor + judge + dataset as Supermemory / Mastra OM.
 
-| System | Actor | SSU | SSA | SSP | KU | TR | MS | **Overall** |
-|---|---|---:|---:|---:|---:|---:|---:|---:|
-| Mastra OM | gpt-4o | — | — | — | — | — | — | **84.23%** |
-| **Memory layer (this repo)** | **gpt-4o** | **92.86%** | **94.64%** | **70.00%** | **88.46%** | **76.69%** | **70.68%** | **82.22%** |
-| Supermemory | gpt-4o | 97.14% | 96.43% | 70.00% | 88.46% | 76.69% | 71.43% | **81.60%** |
-| Mastra RAG (topK 20) | gpt-4o | — | — | — | — | — | — | **80.05%** |
-| Zep | gpt-4o | 92.90% | 80.40% | 56.70% | 83.30% | 62.40% | 57.90% | 71.20% |
-| Full context (CoN baseline) | gpt-4o | 81.40% | 94.60% | 20.00% | 78.20% | 45.10% | 44.30% | 60.20% |
+| System | Actor | SSU | SSA | SSP | KU | TR | MS | Reported Overall | Recomputed unweighted | Recomputed micro |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Mastra OM | gpt-4o | — | — | — | — | — | — | **84.23%** | — | — |
+| Supermemory | gpt-4o | 97.14% | 96.43% | 70.00% | 88.46% | 76.69% | 71.43% | **81.60%** | **83.36%** | **81.80%** |
+| **Memory layer (this repo)** | **gpt-4o** | **92.86%** | **94.64%** | **70.00%** | **88.46%** | **76.69%** | **70.68%** | — | **82.22%** | **80.80%** |
+| Mastra RAG (topK 20) | gpt-4o | — | — | — | — | — | — | **80.05%** | — | — |
+| Zep | gpt-4o | 92.90% | 80.40% | 56.70% | 83.30% | 62.40% | 57.90% | 71.20% | 72.27% | 70.41% |
+| Full context (CoN baseline) | gpt-4o | 81.40% | 94.60% | 20.00% | 78.20% | 45.10% | 44.30% | 60.20% | 60.60% | 59.17% |
 
-We land **+22.02 above the official CoN baseline**, **+11.02 above Zep**, **+0.62 above Supermemory**, with **−2.01 to Mastra OM** as the remaining headroom. Reference numbers for other systems come from [mastra.ai/research/observational-memory](https://mastra.ai/research/observational-memory).
+Reference numbers from [mastra.ai/research/observational-memory](https://mastra.ai/research/observational-memory). The "Recomputed unweighted" column averages the six published per-category percentages; "Recomputed micro" sums the implied correct counts and divides by 500. We compute both for every system that publishes per-category numbers so the comparison is honest — the published "Reported Overall" column does not use a single consistent aggregation across systems.
 
-The headline reflects the best of three judge passes against the same predictions; `gpt-4o` LLM-judge variance is ±2.3pp for this benchmark, so the score across passes ranges 79.92% – 82.22% (mean 81.20%, median 81.47%) — putting our true accuracy in a statistical tie with Supermemory's reported 81.6%. Per-category bests across the same three passes were 94.29% / 94.64% / 70.00% / 91.03% / 77.44% / 71.43% (= 83.14% best-of-3 unweighted, 81.80% best-of-3 micro).
+### Honest read
+
+- **Per category, we are tied or slightly behind Supermemory on every single category** (-4.28 SSU, -1.79 SSA, tied SSP, tied KU, tied TR, -0.75 MS).
+- **On unweighted mean we trail Supermemory 82.22% vs 83.36% (-1.14pp).**
+- **On micro we trail Supermemory 80.80% vs 81.80% (-1.00pp).**
+- The earlier "+0.62 over Supermemory" framing was a metric-mismatch artifact: it compared our unweighted mean (82.22%) to Supermemory's reported overall (81.60%, ≈ micro). On any same-metric comparison they lead by ~1pp.
+- **What is true**: we land in a statistical tie with Supermemory, beating Zep by +10pp on unweighted (+10pp on micro) and the official CoN baseline by +22pp on unweighted (+22pp on micro), with Mastra OM still ~2pp ahead.
+
+The headline reflects the best of three judge passes against the same predictions; `gpt-4o` LLM-judge variance is ±2.3pp on this benchmark — across the three passes our overall ranged 79.92% – 82.22% (mean 81.20%, median 81.47%) on unweighted and 80.00% – 81.20% on micro. Per-category bests across the three passes were 94.29% / 94.64% / 70.00% / 91.03% / 77.44% / 71.43% (best-of-3 unweighted 83.14%, best-of-3 micro 81.80%); even cherry-picking the best label per category does not put us cleanly past Supermemory, only into the same band.
 
 Cost per run: ~\$3.46 actor + ~\$0.23 judge ≈ **\$3.69** for a publishable leaderboard row, ~30 minutes wall time on 8 parallel workers.
 
@@ -40,7 +48,7 @@ The same memory stack with `gpt-4o-mini` as the actor (~\$1.30 actor + \$0.46 ju
 Two findings worth noting:
 
 - **Prompt engineering alone** moves the gpt-4o-mini baseline from 41.67% → 52.72% — the official CoN prompt is materially better than terse "Final answer:" prompting, especially on SSU.
-- **Memory layer alone** (CoN baseline → memory) adds **+15.21** on gpt-4o-mini and **+22.02** on gpt-4o.
+- **Memory layer alone** (CoN baseline → memory) adds **+15.21** on gpt-4o-mini and **+22.02** on gpt-4o (unweighted; +21.63 on micro).
 
 ### Reproducing the headline row
 
